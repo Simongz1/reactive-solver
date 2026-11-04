@@ -165,8 +165,8 @@ void RK3Step(std::vector<Eigen::VectorXd>& state)
 
 int main(int argc, char* argv[]){
 
-    if (argc != 7){
-        std::cerr << "Usage: " << argv[0] << " N l T_init T_0 dt outputFileName" << std::endl;
+    if (argc != 9){
+        std::cerr << "Usage: " << argv[0] << " N l T_init T_0 dt outputFileName numSteps stride" << std::endl;
         return 1;
     }
 
@@ -177,6 +177,8 @@ int main(int argc, char* argv[]){
         params::T_0 = std::stod(argv[4]);
         params::dt = std::stod(argv[5]);
         params::outputFileName = std::string(argv[6]);
+        params::numSteps = std::stoi(argv[7]);
+        params::stride = std::stoi(argv[8]);
 
         if (!std::isfinite(params::dt) || params::dt <= 0 || 
             params::N <= 2 || !std::isfinite(params::l) || 

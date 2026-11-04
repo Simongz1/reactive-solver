@@ -5,29 +5,35 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-dt = [1e-6, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3]
-N = [1000, 750, 500, 250]
+rerun = input('Run again all cases? (y/n): ')
+
+dt = [1e-6]
+N = [2000, 1000, 500, 250]
 l = [100]
 T_init = [1920]
 T_0 = [300]
+numSteps = [200000]
+stride = [100]
 
-
-for time in dt:
-    for n in N:
-        for T in T_init:
-            for T0 in T_0:
-                name = f'solN{n}T{T}T0{T0}dt{time}.csv'
-                subprocess.run(['./solver', 
-                                str(n), 
-                                str(l[0]), 
-                                str(T), 
-                                str(T0), 
-                                str(time),
-                                name])
+if (rerun == 'y'):
+    for time in dt:
+        for n in N:
+            for T in T_init:
+                for T0 in T_0:
+                    name = f'solN{n}T{T}T0{T0}dt{time}.csv'
+                    subprocess.run(['./solver', 
+                                    str(n), 
+                                    str(l[0]), 
+                                    str(T), 
+                                    str(T0), 
+                                    str(time),
+                                    name,
+                                    str(numSteps[0]),
+                                    str(stride[0])])
 
 
 # Compare the right-moving Y3 threshold front for every case.
-threshold = 0.95
+threshold = 0.99
 fig, ax = plt.subplots(figsize=(12, 7))
 colors = plt.get_cmap("tab10")
 line_styles = ["-", "--", "-.", ":"]
@@ -97,6 +103,9 @@ if plotted:
     ax.legend(fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1))
 else:
     print("No cases have a measurable front velocity.")
+
+# ax.set_xlim(0.2, 0.3)
+# ax.set_ylim(0, 200)
 fig.tight_layout()
 fig.savefig("deflagration_velocity_all_cases.png", dpi=300, bbox_inches="tight")
 plt.show()

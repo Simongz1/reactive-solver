@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 
 folder = Path(__file__).resolve().parent
-data = pd.read_csv(folder / "solution.csv")
+data = pd.read_csv(folder / "solN1000T1920T0300dt1e-06.csv")
 steps = sorted(data["step"].unique())
 
 frame_stride = 100

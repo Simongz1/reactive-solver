@@ -14,6 +14,8 @@ namespace params{
     inline unsigned int highTempEnd;
 
     inline std::string outputFileName;
+    inline unsigned int numSteps;
+    inline unsigned int stride;
 
     inline void update(){
         dx = l / (N - 1);
@@ -26,8 +28,6 @@ namespace params{
     const double Y2_init = 0.0;
     const double Y3_init = 1.0 - Y1_init - Y2_init;
     const int nvars = 4;
-    const unsigned int numSteps = 50000;
-    const unsigned int stride = 50;
     //thermodynamic constants
     const double R = 1.987;
     const double cv = 2355.592;
