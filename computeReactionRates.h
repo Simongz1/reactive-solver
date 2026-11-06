@@ -20,7 +20,7 @@ namespace reactionRates{
         const double & current_T
     )
     {
-        bool changing = current_T > 1700 ? true : false;
+        bool changing = current_T > 1736.6 ? true : false;
         if (!changing){
             return a;
         }else{

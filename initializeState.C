@@ -35,7 +35,7 @@ void initialConditions(std::vector<Eigen::VectorXd> &state)
     for (unsigned int i = 0; i < params::N; ++i)
     {
         //set T and Y1 at the specified locations
-        if (i >= params::highTempStart && i <= params::highTempEnd)
+        if (i >= params::highTempStart && i <= params::highTempEnd - 1)
         //T
         {
             state[3][i] = T_init;

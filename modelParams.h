@@ -35,7 +35,7 @@ namespace params{
     const double rho = 1820e-9;
     const double alpha = k / rho / cv;
     //sakano parameters
-    const double E1 = 24300;
+    const double E1 = 24400;
     const double E2 = 23500;
     const double Z1 = 32103.943853583012;
     const double Z2 = 11810.38092425548;
