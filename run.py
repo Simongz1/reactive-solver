@@ -8,20 +8,26 @@ import matplotlib.pyplot as plt
 
 rerun = input('Run again all cases? (y/n): ')
 
-dt = [1e-5]
-N = [100, 250]
-l = [100]
-T_init = [1900]
+dt = [1e-4]
+# Enable a 5,000 nm domain with a 20 nm hot section at the left end.
+long_left_ignition = True
+left_hot_width_nm = 100
+N = [8000]
+l = [10000]
+T_init = [1920]
 T_0 = [300]
-numSteps = [1450000]
-stride = [100]
+numSteps = [250000]
+stride = [5000] if long_left_ignition else [300]
+
+def case_filename(n, length, hot, cold, timestep):
+    suffix = f"_left{left_hot_width_nm:g}nm" if long_left_ignition else ""
+    return f"solN{n}T{hot}T0{cold}l{length}dt{timestep}{suffix}.csv"
+
 
 # Profile comparisons: physical times in ns, one panel per requested time.
-profile_variable = "Y3"  # Y1, Y2, Y3, or T
-profile_times_ns = [0, 0.1, 0.3, 0.5]
+profile_variable = "v"  # Y1, Y2, Y3, or T
+profile_times_ns = [0, 10, 20, 25]
 
-if profile_variable not in {"Y1", "Y2", "Y3", "T"}:
-    raise ValueError("profile_variable must be Y1, Y2, Y3, or T")
 if not profile_times_ns or not all(
     np.isfinite(t) and t >= 0 for t in profile_times_ns
 ):
@@ -51,8 +57,8 @@ if (rerun == 'y'):
             for length in l:
                 for T in T_init:
                     for T0 in T_0:
-                        name = f'solN{n}T{T}T0{T0}l{length}dt{time}.csv'
-                        subprocess.run(['./solver', 
+                        name = case_filename(n, length, T, T0, time)
+                        subprocess.run(['./mechanics1D', 
                                         str(n), 
                                         str(length),
                                         str(T), 
@@ -60,7 +66,8 @@ if (rerun == 'y'):
                                         str(time),
                                         name,
                                         str(numSteps[0]),
-                                        str(stride[0])])
+                                        str(stride[0]),
+                                        str(1)] + ([str(left_hot_width_nm)] if long_left_ignition else []), check=True)
 
 # Compare the right-moving Y3 threshold front for every case.
 threshold = 0.99
@@ -83,7 +90,7 @@ for dt_index, case_dt in enumerate(dt):
         for T in T_init:
             for length in l:
                 for T0 in T_0:
-                    name = f"solN{n}T{T}T0{T0}l{length}dt{case_dt}.csv"
+                    name = case_filename(n, length, T, T0, case_dt)
                     try:
                         data = pd.read_csv(name, usecols=list(dict.fromkeys(["step", "X", "Y3", profile_variable])))
                     except (OSError, ValueError, pd.errors.ParserError) as error:
@@ -95,7 +102,7 @@ for dt_index, case_dt in enumerate(dt):
                     saved_times = (saved_steps.astype(float) - 1) * case_dt
                     case_index = (((dt_index * len(N) + n_index) * len(T_init)
                                 + T_init.index(T)) * len(T_0) + T_0.index(T0))
-                    case_color = colors(case_index % 3)
+                    case_color = colors(case_index % 10)
                     case_style = line_styles[(case_index // 10) % len(line_styles)]
                     for panel, target_time in enumerate(profile_times_ns):
                         tolerance = 1e-12 * max(1.0, abs(target_time))
@@ -142,9 +149,9 @@ for dt_index, case_dt in enumerate(dt):
                             invalid_frames += 1
                             continue
 
-                        midpoint = 0.5 * (x[0] + x[-1])
+                        front_start = x[0] if long_left_ignition else 0.5 * (x[0] + x[-1])
                         crossings = np.flatnonzero(
-                            (x[:-1] >= midpoint)
+                            (x[:-1] >= front_start)
                             & (y[:-1] >= threshold)
                             & (y[1:] < threshold)
                         )

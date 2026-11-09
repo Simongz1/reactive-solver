@@ -10,15 +10,18 @@
 #include <fstream>
 #include <cmath>
 #include <stdexcept>
+#include "pressure.h"
 
 //initialize old state
 Eigen::VectorXd Y1_old = Eigen::VectorXd::Zero(params::N);
 Eigen::VectorXd Y2_old = Eigen::VectorXd::Zero(params::N);
 Eigen::VectorXd Y3_old = Eigen::VectorXd::Zero(params::N);
 Eigen::VectorXd T_old = Eigen::VectorXd::Zero(params::N);
+Eigen::VectorXd rho_old = Eigen::VectorXd::Zero(params::N);
+Eigen::VectorXd vel_old = Eigen::VectorXd::Zero(params::N);
 
 //state vector
-std::vector<Eigen::VectorXd> state = {Y1_old, Y2_old, Y3_old, T_old};
+std::vector<Eigen::VectorXd> state = {Y1_old, Y2_old, Y3_old, T_old, rho_old, vel_old};
 
 //location
 Eigen::VectorXd X = Eigen::VectorXd::Zero(params::N);
@@ -30,6 +33,8 @@ void initialConditions(std::vector<Eigen::VectorXd> &state)
     double Y2_init = params::Y2_init;
     double Y3_init = params::Y3_init;
     double T_init = params::T_init;
+    double rho_init = params::rho_init;
+    double vel_init = params::vel_init;
 
 
     for (unsigned int i = 0; i < params::N; ++i)
@@ -50,6 +55,8 @@ void initialConditions(std::vector<Eigen::VectorXd> &state)
         state[0][i] = Y1_init;
         state[1][i] = Y2_init;
         state[2][i] = Y3_init;
+        state[4][i] = rho_init;
+        state[5][i] = vel_init;
     }
 }
 
@@ -65,6 +72,8 @@ void initializeState()
     Y2_old = state[1];
     Y3_old = state[2];
     T_old = state[3];
+    rho_old = state[4];
+    vel_old = state[5];
 
     //initialize location
     for (unsigned int i = 0; i < params::N; ++i)
@@ -83,7 +92,9 @@ void writeToFile(int iter, const std::vector<Eigen::VectorXd>& state)
              << state[0][i] << ","
              << state[1][i] << ","
              << state[2][i] << ","
-             << state[3][i] << "\n";
+             << state[3][i] << ","
+             << state[4][i] << ","
+             << state[5][i] << "\n";
     }
 }
 
@@ -130,6 +141,37 @@ std::vector<Eigen::VectorXd> assembleResidual(const std::vector<Eigen::VectorXd>
         }
         if (i == params::N - 1){
             residual[3][i] = 0.5 * params::alpha / params::dx / params::dx * (-7.0 * state[3][i] + 8.0 * state[3][i-1] - state[3][i-2]);
+        }
+
+        //add residual for mass and momentum conservation equations
+        //state[4] = rho, state[5] = vel
+
+        if (i > 0 && i < params::N - 1){
+            //mass (density)
+            residual[4][i] = - state[4][i] * (state[5][i+1] - state[5][i-1]) / (2.0 * params::dx);
+            residual[4][i] -= state[5][i] * (state[4][i+1] - state[4][i-1]) / (2.0 * params::dx);
+
+            //momentum (velocity)
+            residual[5][i] = - (state[4][i+1] - state[4][i-1]) / (2.0 * params::dx);
+            residual[5][i] -= 2.0 * state[5][i] * (state[5][i+1] - state[5][i-1]) / (2.0 * params::dx);
+            residual[5][i] += (pressure::value(state[4][i+1], state[3][i+1]) - pressure::value(state[4][i-1], state[3][i-1])) / (2.0 * params::dx);
+        }
+
+        //absobing boundary conditions
+        if (i == 0){
+            residual[4][i] = 0.0;
+            residual[5][i] = 0.0;
+        }
+        if (i == params::N - 1){
+            residual[4][i] = 0.0;
+            residual[5][i] = 0.0;
+        }
+
+        //thermo-mechanical coupling
+        //the thermo-mechanical coupling term is rho0 / rho^2 * d(rho*v)/dx
+
+        if (i > 0 && i < params::N - 1){
+            residual[3][i] += params::rho_init / std::pow(state[4][i], 2) * pressure::dT(state[4][i], state[3][i]) * (state[5][i+1] - state[5][i-1]) / (2.0 * params::dx);
         }
     }
     return residual;
@@ -199,7 +241,7 @@ int main(int argc, char* argv[]){
     //clean old file state
     {
         std::ofstream file(params::outputFileName);
-        file << "step,X,Y1,Y2,Y3,T\n";
+        file << "step,X,Y1,Y2,Y3,T,rho,v\n";
     }
 
     //write the initial state to a csv file

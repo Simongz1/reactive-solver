@@ -17,6 +17,8 @@ namespace params{
     inline unsigned int numSteps;
     inline unsigned int stride;
 
+    inline bool use_artificial_viscosity;
+
     inline void update(){
         dx = l / (N - 1);
         highTempStart = 2000 * N / 5000;
@@ -27,7 +29,7 @@ namespace params{
     const double Y1_init = 1.0;
     const double Y2_init = 0.0;
     const double Y3_init = 1.0 - Y1_init - Y2_init;
-    const int nvars = 4;
+    const int nvars = 6;
     //thermodynamic constants
     const double R = 1.987;
     const double cv = 2355.592;
@@ -43,5 +45,19 @@ namespace params{
     const double b1 = 591.0987132187528;
     const double a2 = 7831116.710159273;
     const double b2 = -722.1193197156482;
+    const double rho_init = 1820e-9;
+    const double vel_init = 0.0;
+
+    //EOS parameters
+    const double A = 13398.42268091;
+    const double R1 = 68.1217746;
+    const double R2 = 6.81217746;
+    const double B = 3810.3712782;
+    const double omega = 0.37;
     //const std::string outputFileName = "solution.csv";
+
+    //artificial viscosity parameters
+    const double C0 = 0.1;
+    const double C1 = 2.0;
+    const double ss = std::sqrt(20.1 / rho_init);
 }

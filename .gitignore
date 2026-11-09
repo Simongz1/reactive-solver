@@ -3,3 +3,10 @@
 *.opt
 *.gif
 *solver*
+
+# Keep the 2D source; ignore local libraries and generated Exodus files.
+!solver2D.C
+.deps/
+*.exodus
+*.exo
+*.e
