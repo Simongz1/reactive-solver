@@ -6,16 +6,19 @@
 #include <string>
 #include <vector>
 
-// One static QUAD4 mesh with four double-precision nodal time histories.
+// One static QUAD4 mesh with double-precision nodal time histories.
 class ExodusOutput {
     int id_ = -1;
     int snapshot_ = 0;
     int nodes_ = 0;
+    int fields_;
     static void check(int code, const char* operation) {
         if (code < 0) throw std::runtime_error(std::string("Exodus: ") + operation);
     }
 public:
-    ExodusOutput(const std::string& path, int nx, int ny, double dx, double dy) {
+    ExodusOutput(const std::string& path, int nx, int ny, double dx, double dy,
+                 std::vector<std::string> names = {"Y1","Y2","Y3","T"})
+        : fields_(static_cast<int>(names.size())) {
         const long long nodes = 1LL * nx * ny;
         const long long cells = 1LL * (nx-1) * (ny-1);
         if (nodes > std::numeric_limits<int>::max() || cells > std::numeric_limits<int>::max())
@@ -26,7 +29,7 @@ public:
         id_ = ex_create(path.c_str(), EX_CLOBBER | EX_LARGE_MODEL, &cpuWord, &fileWord);
         if (id_ < 0) throw std::runtime_error("Cannot create Exodus file: " + path);
         try {
-            check(ex_put_init(id_, "2D reaction diffusion; length nm, time ns, temperature K",
+            check(ex_put_init(id_, "2D reactive model; length nm, time ns, temperature K",
                               2, nodes, cells, 1, 0, 0), "initialize mesh");
             std::vector<double> x(nodes_), y(nodes_);
             for (int j=0; j<ny; ++j) for (int i=0; i<nx; ++i) {
@@ -46,10 +49,10 @@ public:
                 conn.insert(conn.end(), {p,p+1,p+nx+1,p+nx});
             }
             check(ex_put_conn(id_, EX_ELEM_BLOCK, 1, conn.data(), nullptr, nullptr), "write connectivity");
-            check(ex_put_variable_param(id_, EX_NODAL, 4), "define nodal fields");
-            char a[]="Y1", b[]="Y2", c[]="Y3", d[]="T";
-            char* names[]={a,b,c,d};
-            check(ex_put_variable_names(id_, EX_NODAL, 4, names), "name nodal fields");
+            std::vector<char*> labels;
+            for (auto& name : names) labels.push_back(name.data());
+            check(ex_put_variable_param(id_, EX_NODAL, fields_), "define nodal fields");
+            check(ex_put_variable_names(id_, EX_NODAL, fields_, labels.data()), "name nodal fields");
         } catch (...) {
             ex_close(id_); id_=-1; throw;
         }
@@ -59,9 +62,10 @@ public:
     ~ExodusOutput() { if (id_>=0) ex_close(id_); }
     template<class State>
     void write(double time, const State& state) {
+        if (state.size() != static_cast<size_t>(fields_)) throw std::runtime_error("Exodus field count mismatch");
         ++snapshot_;
         check(ex_put_time(id_, snapshot_, &time), "write time");
-        for (int k=0; k<4; ++k) {
+        for (int k=0; k<fields_; ++k) {
             if (state[k].size()!=nodes_) throw std::runtime_error("Exodus field size does not match mesh");
             check(ex_put_var(id_, snapshot_, EX_NODAL, k+1, 1, nodes_, state[k].data()), "write nodal field");
         }

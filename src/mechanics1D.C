@@ -1,5 +1,4 @@
 //initialize state
-
 #include "modelParams.h"
 #include <vector>
 #include <algorithm>
@@ -116,7 +115,11 @@ std::vector<Eigen::VectorXd> assembleResidual(const std::vector<Eigen::VectorXd>
         const double J = params::rho_init / rho;
         const double Jdot = J * (gradm / rho - state[5][i] * gradrho / (rho * rho));
         jacobianRate[i] = Jdot;
-        stress[i] = pressure::value(rho, state[3][i]);
+
+        //compute both pressures, then interpolate
+        const double &p_unreacted = pressure::value(rho, state[3][i], false);
+        const double &p_reacted = pressure::value(rho, state[3][i], true);
+        stress[i] = p_unreacted * state[0][i] + (1.0 - state[0][i]) * p_reacted;
     }
 
     // A shared face stress sees adjacent-node jumps, including alternating modes.
@@ -184,8 +187,9 @@ std::vector<Eigen::VectorXd> assembleResidual(const std::vector<Eigen::VectorXd>
             residual[5][i] += std::pow(state[5][i] / state[4][i], 2) * grad(state[4], i, params::dx);
 
             residual[5][i] += grad(stress, i, params::dx);
-            if (params::use_artificial_viscosity)
+            if (params::use_artificial_viscosity){
                 residual[5][i] -= (facePressure[i] - facePressure[i-1]) / params::dx;
+            } 
         }
 
         //rigid
@@ -201,7 +205,10 @@ std::vector<Eigen::VectorXd> assembleResidual(const std::vector<Eigen::VectorXd>
         //thermo-mechanical coupling
         //the thermo-mechanical coupling term is rho0 / rho^2 * d(rho*v)/dx
         if (i > 0 && i < params::N - 1){
-            residual[3][i] += (1.0 / rho / params::cv) * pressure::dT(state[4][i], state[3][i]) * Jdot / J;
+            const double Y1 = state[0][i];
+            const double dStressdT = Y1 * pressure::dT(rho, state[3][i], false)
+                                   + (1.0 - Y1) * pressure::dT(rho, state[3][i], true);
+            residual[3][i] += (1.0 / rho / params::cv) * dStressdT * Jdot / J;
         }
     }
     return residual;

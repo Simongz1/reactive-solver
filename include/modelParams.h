@@ -48,12 +48,19 @@ namespace params{
     const double rho_init = 1820e-9;
     const double vel_init = 0.0;
 
-    //EOS parameters
-    const double A = 13398.42268091;
-    const double R1 = 68.1217746;
-    const double R2 = 6.81217746;
-    const double B = 3810.3712782;
-    const double omega = 0.37;
+    //EOS parameters for unreacted material
+    const double A_unreacted = 13398.42268091;
+    const double R1_unreacted = 68.1217746;
+    const double R2_unreacted = 6.81217746;
+    const double B_unreacted = 3810.3712782;
+    const double omega_unreacted = 0.37;
+
+    //EOS parameters for reacted material
+    const double A_reacted = 1000;
+    const double R1_reacted = 59.99058313;
+    const double R2_reacted = 5.999058313;
+    const double B_reacted = 2738.01645291;
+    const double omega_reacted = 0.77;
     //const std::string outputFileName = "solution.csv";
 
     //artificial viscosity parameters

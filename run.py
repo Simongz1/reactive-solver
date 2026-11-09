@@ -8,25 +8,25 @@ import matplotlib.pyplot as plt
 
 rerun = input('Run again all cases? (y/n): ')
 
-dt = [1e-4]
+dt = [1e-6]
 # Enable a 5,000 nm domain with a 20 nm hot section at the left end.
-long_left_ignition = True
-left_hot_width_nm = 100
-N = [8000]
-l = [10000]
+long_left_ignition = False
+left_hot_width_nm = 50
+N = [500]
+l = [1000]
 T_init = [1920]
 T_0 = [300]
-numSteps = [250000]
-stride = [5000] if long_left_ignition else [300]
+numSteps = [1000000]
+stride = [500]
 
 def case_filename(n, length, hot, cold, timestep):
     suffix = f"_left{left_hot_width_nm:g}nm" if long_left_ignition else ""
-    return f"solN{n}T{hot}T0{cold}l{length}dt{timestep}{suffix}.csv"
+    return f"./csv/solN{n}T{hot}T0{cold}l{length}dt{timestep}{suffix}.csv"
 
 
 # Profile comparisons: physical times in ns, one panel per requested time.
-profile_variable = "v"  # Y1, Y2, Y3, or T
-profile_times_ns = [0, 10, 20, 25]
+profile_variable = "T"  # Y1, Y2, Y3, or T
+profile_times_ns = [0, 0.03, 0.05, 0.07]
 
 if not profile_times_ns or not all(
     np.isfinite(t) and t >= 0 for t in profile_times_ns
