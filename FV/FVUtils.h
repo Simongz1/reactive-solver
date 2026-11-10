@@ -8,10 +8,9 @@
 #include "Eigen/Dense"
 
 namespace FVUtils{
-    inline struct cell{
-        std::vector<double> location;
-        std::vector
-    }
+    inline struct face{
+        std::vector<double> normal;
+    };
 }
 
 #endif // FVUTILS_H
