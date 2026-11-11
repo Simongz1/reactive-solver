@@ -20,13 +20,12 @@
 Eigen::VectorXd Y1_old = Eigen::VectorXd::Zero(params::N);
 Eigen::VectorXd Y2_old = Eigen::VectorXd::Zero(params::N);
 Eigen::VectorXd Y3_old = Eigen::VectorXd::Zero(params::N);
-Eigen::VectorXd T_old = Eigen::VectorXd::Zero(params::N);
 Eigen::VectorXd rho_old = Eigen::VectorXd::Zero(params::N);
 Eigen::VectorXd m_old = Eigen::VectorXd::Zero(params::N);
 Eigen::VectorXd rhoE_old = Eigen::VectorXd::Zero(params::N);
 
 //state vector
-std::vector<Eigen::VectorXd> state = {Y1_old, Y2_old, Y3_old, T_old, rho_old, m_old, rhoE_old};
+std::vector<Eigen::VectorXd> state = {Y1_old, Y2_old, Y3_old, rho_old, m_old, rhoE_old};
 
 //location
 Eigen::VectorXd X = Eigen::VectorXd::Zero(params::N);
@@ -41,7 +40,7 @@ void initialConditions(std::vector<Eigen::VectorXd> &state)
     double Y3_init = params::Y3_init;
     double T_init = params::T_init;
     double rho_init = params::rho_init;
-    double m_init = params::vel_init / params::rho_init;
+    double m_init = rho_init * params::vel_init;
 
 
     for (unsigned int i = 0; i < params::N; ++i)
@@ -49,21 +48,54 @@ void initialConditions(std::vector<Eigen::VectorXd> &state)
         const bool hot = leftHotWidthNm > 0.0
             ? i * params::dx < leftHotWidthNm
             : i >= params::highTempStart && i < params::highTempEnd;
-        state[3][i] = hot ? T_init : params::T_0;
+        const double T = hot ? T_init : params::T_0;
 
         //other variables remain unchanged
-        state[0][i] = Y1_init;
-        state[1][i] = Y2_init;
-        state[2][i] = Y3_init;
-        state[4][i] = rho_init;
-        state[5][i] = m_init;
+        state[0][i] = rho_init * Y1_init;
+        state[1][i] = rho_init * Y2_init;
+        state[2][i] = rho_init * Y3_init;
+        state[3][i] = rho_init;
+        state[4][i] = m_init;
+        state[5][i] = rho_init * params::cv * T + 0.5 * m_init * params::vel_init;
     }
+}
+
+// e = cv*T + e_ref(rho,Y1), with e_ref = 0 at rho_init for both phases.
+double referenceEnergy(double rho, bool reacted)
+{
+    const double compression = 1.0 - params::rho_init/rho;
+    const double omega = reacted ? params::omega_reacted : params::omega_unreacted;
+    const auto coldWork = [compression](double A, double R) {
+        return A*std::exp(-R)*(std::expm1(R*compression)/R - compression);
+    };
+    const double A = reacted ? params::A_reacted : params::A_unreacted;
+    const double B = reacted ? params::B_reacted : params::B_unreacted;
+    const double R1 = reacted ? params::R1_reacted : params::R1_unreacted;
+    const double R2 = reacted ? params::R2_reacted : params::R2_unreacted;
+    return (coldWork(A,R1) + coldWork(B,R2))/params::rho_init
+         + omega*params::cv*300.0*std::log(params::rho_init/rho);
+}
+
+double temperature(const std::vector<Eigen::VectorXd>& state, int i)
+{
+    const double rho = state[3][i];
+    const double u = state[4][i]/rho;
+    const double Y1 = state[0][i]/rho;
+    const double e = state[5][i]/rho - 0.5*u*u;
+    return (e - Y1*referenceEnergy(rho,false) - (1-Y1)*referenceEnergy(rho,true))/params::cv;
+}
+
+double stress(const std::vector<Eigen::VectorXd>& state, int i){
+    const double rho = state[3][i];
+    const double &Y1 = state[0][i] / rho;
+    const double &T = temperature(state,i);
+    return Y1 * pressure::value(rho, T, false) + (1.0 - Y1) * pressure::value(rho, T, true);
 }
 
 //set the state from the initial conditions
 void initializeState()
 {
-    state.assign(params::nvars, Eigen::VectorXd::Zero(params::N));
+    state.assign(state.size(), Eigen::VectorXd::Zero(params::N));
     X = Eigen::VectorXd::Zero(params::N);
 
     initialConditions(state);
@@ -71,10 +103,9 @@ void initializeState()
     Y1_old = state[0];
     Y2_old = state[1];
     Y3_old = state[2];
-    T_old = state[3];
-    rho_old = state[4];
-    m_old = state[5];
-    rhoE_old = state[6];
+    rho_old = state[3];
+    m_old = state[4];
+    rhoE_old = state[5];
 
     //initialize location
     for (unsigned int i = 0; i < params::N; ++i)
@@ -90,171 +121,102 @@ void writeToFile(int iter, const std::vector<Eigen::VectorXd>& state)
     for (int i = 0; i < params::N; ++i) {
         file << iter << ","
              << X[i] << ","
-             << state[0][i] << ","
-             << state[1][i] << ","
-             << state[2][i] << ","
+             << state[0][i] / state[3][i] << ","
+             << state[1][i] / state[3][i] << ","
+             << state[2][i] / state[3][i] << ","
+             << temperature(state,i) << ","
              << state[3][i] << ","
-             << state[4][i] << ","
-             << state[5][i] / state[4][i] << ","
-             << state[6][i] << "\n";
+             << state[4][i] / state[3][i] << ","
+             << state[5][i] << ","
+             << stress(state,i) << "\n";
     }
 }
 
 //set a function to assemble the residual
 std::vector<Eigen::VectorXd> assembleResidual(const std::vector<Eigen::VectorXd> &state)
 {   
-    std::vector<Eigen::VectorXd> residual(params::nvars, Eigen::VectorXd::Zero(params::N));
+    std::vector<Eigen::VectorXd> residual(state.size(), Eigen::VectorXd::Zero(params::N));
 
     //pre-allocate rates
     Eigen::VectorXd r1(params::N);
     Eigen::VectorXd r2(params::N);
 
     // Endpoint stresses enter the gradients at the first and last interior nodes.
-    Eigen::VectorXd stress(params::N), jacobianRate(params::N);
+    Eigen::VectorXd stress(params::N), Tfield(params::N);
+    // Face vector order: rhoY1, rhoY2, rhoY3, rho, m, rhoE.
+    Eigen::MatrixXd conserved(6, params::N), flux(6, params::N);
+    Eigen::VectorXd c2(params::N), velocity(params::N);
     for (int i = 0; i < params::N; ++i) {
-        const int left = i == 0 ? 0 : i - 1;
-        const int right = i == params::N - 1 ? i : i + 1;
-        const double span = (right - left) * params::dx;
-        const double gradm = (state[5][right] - state[5][left]) / span;
-        const double gradrho = (state[4][right] - state[4][left]) / span;
-        const double rho = state[4][i];
-        const double J = params::rho_init / rho;
-        const double Jdot = J * (gradm / rho - state[5][i] * gradrho / (rho * rho));
-        jacobianRate[i] = Jdot;
+        const double rho = state[3][i];
+        const double T = temperature(state,i);
+        Tfield[i] = T;
 
         //compute both pressures, then interpolate
-        const double &p_unreacted = pressure::value(rho, state[3][i], false);
-        const double &p_reacted = pressure::value(rho, state[3][i], true);
-        stress[i] = p_unreacted * state[0][i] + (1.0 - state[0][i]) * p_reacted;
+        const double &p_unreacted = pressure::value(rho, T, false);
+        const double &p_reacted = pressure::value(rho, T, true);
+        const double Y1 = state[0][i] / rho;
+        stress[i] = p_unreacted * Y1 + (1.0 - Y1) * p_reacted;
+        const double pRho = Y1 * pressure::drho(rho,T,false) + (1-Y1) * pressure::drho(rho,T,true);
+        const double stressT = Y1 * pressure::dT(rho,T,false) + (1-Y1) * pressure::dT(rho,T,true);
+        c2[i] = pRho + T * stressT * stressT / (rho * rho * params::cv);
+        velocity[i] = state[4][i] / rho;
+
+        conserved.col(i) << state[0][i], state[1][i], state[2][i], rho, state[4][i], state[5][i];
+        flux.col(i) = velocity[i] * conserved.col(i);
+        flux(4,i) -= stress[i];
+        flux(5,i) -= velocity[i] * stress[i];
     }
 
-    // A shared face stress sees adjacent-node jumps, including alternating modes.
-    Eigen::VectorXd facePressure;
-    if (params::use_artificial_viscosity) {
-        facePressure.resize(params::N - 1);
-        for (int i = 0; i + 1 < params::N; ++i) {
-            const double rhoFace = 0.5 * (state[4][i] + state[4][i+1]);
-            const double jump = state[5][i] / state[4][i] - state[5][i+1] / state[4][i+1];
-            const double compression = std::max(0.0, jump);
-            facePressure[i] = rhoFace * compression *
-                (params::C0 * compression + params::C1 * params::ss);
+    // Endpoints are rigid walls with half-width control volumes.
+    Eigen::MatrixXd faceFlux = Eigen::MatrixXd::Zero(6, params::N + 1);
+    faceFlux(4,0) = -stress[0];
+    faceFlux(4,params::N) = -stress[params::N-1];
+    for (int i = 0; i+1 < params::N; ++i) {
+        faceFlux.col(i+1) = limiter::eval(flux.col(i), flux.col(i+1),
+            conserved.col(i), conserved.col(i+1), c2[i], c2[i+1], velocity[i], velocity[i+1]);
+        faceFlux(5,i+1) -= params::k * (Tfield[i+1] - Tfield[i]) / params::dx;
+        if (params::use_artificial_viscosity) {
+            const double compression = std::max(0.0, velocity[i] - velocity[i+1]);
+            const double q = 0.5 * (state[3][i] + state[3][i+1]) * compression
+                           * (params::C0 * compression + params::C1 * params::ss);
+            faceFlux(4,i+1) += q;
+            faceFlux(5,i+1) += 0.5 * (velocity[i] + velocity[i+1]) * q;
         }
     }
 
     for (unsigned int i = 0; i < params::N; ++i){
-        const double rho = state[4][i];
-        const double J = params::rho_init / rho;
-        const double Jdot = jacobianRate[i];
-
-        r1[i] = reactionRates::computeArrhenius(state[3][i],
+        const double rho = state[3][i];
+        r1[i] = reactionRates::computeArrhenius(Tfield[i],
                                     params::R, 
                                     params::E1, 
                                     params::Z1);
 
-        r2[i] = reactionRates::computeArrhenius(state[3][i],
+        r2[i] = reactionRates::computeArrhenius(Tfield[i],
                                     params::R, 
                                     params::E2, 
                                     params::Z2);
 
         /// SPECIES CONSERVATION ///
 
-        //conservative advection via face flux rho * Y * V
-        if (i > 0 && i < params::N - 1){
-            //compute limiter and reconstruct face flux
-            const double &leftMomentumValue = state[5][i-1];
-            const double &rightMomentumValue = state[5][i+1];
-            const double &centerMomentumValue = state[5][i];
-
-            for (unsigned int j = 0; j < 2; ++j){
-                const double &leftRhoFlux = limiter::eval(leftMomentumValue * state[j][i-1], centerMomentumValue * state[j][i], pressure::c2(state[4]));
-                const double &rightRhoFlux = limiter::eval(centerMomentumValue * state[j][i], rightMomentumValue * state[j][i+1], pressure::c2(state[4]));
-                //use these values to sum face fluxes
-                residual[j][i] = -(rightRhoFlux - leftRhoFlux) / params::dx;
-            }
-        }
+        const bool wall = i == 0 || i == params::N - 1;
+        const double width = wall ? 0.5 * params::dx : params::dx;
+        const Eigen::VectorXd transport = (faceFlux.col(i) - faceFlux.col(i+1)) / width;
+        for (int j = 0; j < 3; ++j) residual[j][i] = transport[j];
+        residual[3][i] = transport[3];
+        residual[4][i] = wall ? 0.0 : transport[4];
+        residual[5][i] = transport[5];
 
         //local sources for species
         residual[0][i] += - r1[i] * state[0][i];
         residual[1][i] += r1[i] * state[0][i] - r2[i] * state[1][i];
         residual[2][i] += r2[i] * state[1][i];
 
-        const double Q1 = reactionRates::computeReactionHeat(params::a1, params::b1, state[3][i]);
-        const double Q2 = reactionRates::computeReactionHeat(params::a2, params::b2, state[3][i]);
+        const double Q1 = reactionRates::computeReactionHeat(params::a1, params::b1, Tfield[i]);
+        const double Q2 = reactionRates::computeReactionHeat(params::a2, params::b2, Tfield[i]);
 
-        //set the T contribution
-        residual[3][i] = (params::rho_init / rho / params::cv) * (Q1 * r1[i] * state[0][i] + Q2 * r2[i] * state[1][i]);
-
-        //add conduction contribution
-        if (i > 0 && i < params::N - 1){
-            residual[3][i] += params::alpha / params::dx / params::dx * (state[3][i+1] - 2*state[3][i] + state[3][i-1]);
-        }
-
-        //robin BC: set temperature value and flux
-        if (i == 0){
-            residual[3][i] = 0.5 * params::alpha / params::dx / params::dx * (-7.0 * state[3][i] + 8.0 * state[3][i+1] - state[3][i+2]);
-        }
-        if (i == params::N - 1){
-            residual[3][i] = 0.5 * params::alpha / params::dx / params::dx * (-7.0 * state[3][i] + 8.0 * state[3][i-1] - state[3][i-2]);
-        }
-
-        //add residual for mass and momentum conservation equations
-        //state[4] = rho, state[5] = m
-
-        if (i > 0 && i < params::N - 1){
-            //density: flux of rho * v = m
-            //compute face flux for density
-            const double &leftMFlux = limiter::eval(state[5][i], i, pressure::c2(state[4]));
-            const double &rightMFlux = limiter::eval(state[5][i], i, pressure::c2(state[4]));
-            residual[4][i] = - (rightMFlux - leftMFlux) / params::dx;
-
-            //momentum: flux of m^2 / rho + p
-            //compute face flux for momentum
-            //compute pressure at faces
-            const double &leftY1 = state[0][i-1];
-            const double &rightY1 = state[0][i+1];
-            const double &leftPUnreacted = pressure::value(state[4][i-1], state[3][i-1], false);
-            const double &rightPUnreacted = pressure::value(state[4][i+1], state[3][i+1], false);
-            const double &leftPReactive = pressure::value(state[4][i-1], state[3][i-1], true);
-            const double &rightPReactive = pressure::value(state[4][i+1], state[3][i+1], true);
-            const double &leftP = leftY1 * leftPReactive + (1.0 - leftY1) * leftPUnreacted;
-            const double &rightP = rightY1 * rightPReactive + (1.0 - rightY1) * rightPUnreacted;
-
-            const double &leftMomFlux = limiter::eval(state[5][i] * state[5][i] / state[4][i] + stress[i] + leftP, i, pressure::c2(state[4]));
-            const double &rightMomFlux = limiter::eval(state[5][i] * state[5][i] / state[4][i] + stress[i] + rightP, i, pressure::c2(state[4]));
-
-            residual[5][i] = - (rightMomFlux - leftMomFlux) / params::dx;
-            // residual[5][i] = - 2.0 * state[5][i] / state[4][i] * grad(state[5], i, params::dx);
-            // residual[5][i] += std::pow(state[5][i] / state[4][i], 2) * grad(state[4], i, params::dx);
-
-            // residual[5][i] += grad(stress, i, params::dx);
-            // if (params::use_artificial_viscosity){
-            //     residual[5][i] -= (facePressure[i] - facePressure[i-1]) / params::dx;
-            // } 
-
-            //energy: flux of rho * v * e + p * v
-            const double &leftEnergyFlux = limiter::eval(state[4][i] * state[5][i] * state[6][i] + stress[i] * state[5][i], i, pressure::c2(state[4]));
-            const double &rightEnergyFlux = limiter::eval(state[4][i] * state[5][i] * state[6][i] + stress[i] * state[5][i], i, pressure::c2(state[4]));
-            residual[6][i] = - (rightEnergyFlux - leftEnergyFlux) / params::dx;
-        }
-
-        //rigid
-        if (i == 0){
-            residual[4][i] = -state[5][1] / params::dx;
-            residual[5][i] = 0.0;
-        }
-        if (i == params::N - 1){
-            residual[4][i] = state[5][i-1] / params::dx;
-            residual[5][i] = 0.0;
-        }
-
-        //thermo-mechanical coupling
-        //the thermo-mechanical coupling term is rho0 / rho^2 * d(rho*v)/dx
-        if (i > 0 && i < params::N - 1){
-            const double Y1 = state[0][i];
-            const double dStressdT = Y1 * pressure::dT(rho, state[3][i], false)
-                                   + (1.0 - Y1) * pressure::dT(rho, state[3][i], true);
-            residual[3][i] += (1.0 / rho / params::cv) * dStressdT * Jdot / J;
-        }
+        // Heat release per reference volume, with pressure work already in the face flux.
+        residual[5][i] += (params::rho_init/rho) *
+            (Q1*r1[i]*state[0][i] + Q2*r2[i]*state[1][i]);
     }
     return residual;
 }
@@ -269,19 +231,19 @@ void RK3Step(std::vector<Eigen::VectorXd>& state)
     auto R = assembleResidual(state_n);
 
     //first iteration
-    for (unsigned int j = 0; j < params::nvars; ++j){
+    for (unsigned int j = 0; j < state.size(); ++j){
         state1[j] = state_n[j] + params::dt * R[j];
     }
 
     //second iteration
     R = assembleResidual(state1);
-    for (unsigned int j = 0; j < params::nvars; ++j){
+    for (unsigned int j = 0; j < state.size(); ++j){
         state2[j] = 0.75 * state_n[j] + 0.25 * state1[j] + 0.25 * params::dt * R[j];
     }
 
     //final iteration
     R = assembleResidual(state2);
-    for (unsigned int j = 0; j < params::nvars; ++j){
+    for (unsigned int j = 0; j < state.size(); ++j){
         state[j] = (1.0 / 3.0) * state_n[j] + (2.0 / 3.0) * state2[j] + (2.0 / 3.0) * params::dt * R[j];
     }
 }
@@ -338,7 +300,7 @@ int main(int argc, char* argv[]){
     //clean old file state
     {
         std::ofstream file(params::outputFileName);
-        file << "step,X,Y1,Y2,Y3,T,rho,v\n";
+        file << "step,X,Y1,Y2,Y3,T,rho,v,rhoE,p\n";
     }
 
     //write the initial state to a csv file

@@ -3,6 +3,8 @@
 *.opt
 *.gif
 *solver*
+*.mp4
+*.ogv
 
 # Keep the 2D source; ignore local libraries and generated Exodus files.
 !solver2D.C

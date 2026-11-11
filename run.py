@@ -8,15 +8,15 @@ import matplotlib.pyplot as plt
 
 rerun = input('Run again all cases? (y/n): ')
 
-dt = [1e-6]
+dt = [1e-4]
 # Enable a 5,000 nm domain with a 20 nm hot section at the left end.
-long_left_ignition = False
-left_hot_width_nm = 50
+long_left_ignition = True
+left_hot_width_nm = 200
 N = [500]
-l = [1000]
+l = [5000]
 T_init = [1920]
 T_0 = [300]
-numSteps = [1000000]
+numSteps = [100000]
 stride = [500]
 
 def case_filename(n, length, hot, cold, timestep):
@@ -25,8 +25,8 @@ def case_filename(n, length, hot, cold, timestep):
 
 
 # Profile comparisons: physical times in ns, one panel per requested time.
-profile_variable = "T"  # Y1, Y2, Y3, or T
-profile_times_ns = [0, 0.03, 0.05, 0.07]
+profile_variable = "p"  # Y1, Y2, Y3, or T
+profile_times_ns = [0, 0.5, 1, 1.5]
 
 if not profile_times_ns or not all(
     np.isfinite(t) and t >= 0 for t in profile_times_ns
@@ -58,7 +58,7 @@ if (rerun == 'y'):
                 for T in T_init:
                     for T0 in T_0:
                         name = case_filename(n, length, T, T0, time)
-                        subprocess.run(['./mechanics1D', 
+                        subprocess.run(['./mechanics1DFV', 
                                         str(n), 
                                         str(length),
                                         str(T), 

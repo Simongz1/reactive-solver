@@ -7,24 +7,22 @@
 #include "pressure.h"
 
 namespace limiter {
-    inline double computeLimit(const double & c2,
-                               const double & u_left,
-                               const double & u_right)
-    {
-        //define the limiter
-        const double c = std::sqrt(c2);
-        const double left = std::abs(u_left) + c;
-        const double right = std::abs(u_right) + c;
-        return std::max(left, right);
-    }
-    inline double eval(const Eigen::VectorXd & leftFlux,
+
+    inline Eigen::VectorXd eval(const Eigen::VectorXd & leftFlux,
                        const Eigen::VectorXd & rightFlux,
                        const Eigen::VectorXd & leftConserved,
                        const Eigen::VectorXd & rightConserved,
-                       const double & c2)
+                       const double & c2_left,
+                       const double & c2_right,
+                       const double & leftVelocity, 
+                       const double & rightVelocity)
     {
-       //return the limited slope value
-       const double average = 0.5 * (leftFlux + rightFlux);
-       return average - 0.5 * computeLimit(c2, leftConserved, rightConserved);
+       //left and right sound speeds
+       const double c_left = std::sqrt(c2_left);
+       const double c_right = std::sqrt(c2_right);
+
+       //compute the limit at the interface
+       const double limitFace = std::max(std::abs(leftVelocity) + c_left, std::abs(rightVelocity) + c_right);
+       return 0.5 * (rightFlux + leftFlux) - 0.5 * limitFace * (rightConserved - leftConserved);
     }
 }
