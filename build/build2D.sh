@@ -3,8 +3,8 @@ set -eu
 cd "$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 target=${1:-solver2D}
 case "$target" in
-    solver2D|mechanics2D) ;;
-    *) echo "Expected solver2D or mechanics2D" >&2; exit 1 ;;
+    solver2D|mechanics2D|mechanics2DLevelSet|mechanics2DFV|mechanics2DFV_limiter|kinetics2D|kinetics2DFV) ;;
+    *) echo "Expected solver2D, mechanics2D, mechanics2DLevelSet, mechanics2DFV, mechanics2DFV_limiter, kinetics2D, or kinetics2DFV" >&2; exit 1 ;;
 esac
 EXODUS_ROOT=${EXODUS_ROOT:-"$PWD/.deps/exodus"}
 if [ -z "${EIGEN_INCLUDE_DIR:-}" ]; then

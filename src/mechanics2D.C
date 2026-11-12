@@ -1,3 +1,5 @@
+// Finite-difference mechanics with SSP RK3.
+#include <cmath>
 #include "ExodusOutput.h"
 #include <filesystem>
 #include <memory>
@@ -18,6 +20,7 @@ constexpr int nvars = 7;
 int nx, ny;
 double dx, dy;
 double leftHotWidthNm = 0.0;
+double circularHotRadiusNm = 0.0; // Centered at (Lx/2, Ly/2) when positive.
 
 double shockSpeed = 0.0;
 double pistonSpeed = 0.0;
@@ -97,7 +100,11 @@ void initialConditions(State& state)
     }
     for (int j = 0; j < ny; ++j) {
         for (int i = 0; i < nx; ++i) {
-            const bool hot = leftHotWidthNm > 0 ? i * dx < leftHotWidthNm
+            const double offsetX = i*dx - 0.5*(nx-1)*dx;
+            const double offsetY = j*dy - 0.5*(ny-1)*dy;
+            const bool hot = circularHotRadiusNm > 0
+                ? offsetX*offsetX + offsetY*offsetY <= circularHotRadiusNm*circularHotRadiusNm
+                : leftHotWidthNm > 0 ? i*dx < leftHotWidthNm
                 : i >= 2LL*nx/5 && i < 3LL*nx/5 && j >= 2LL*ny/5 && j < 3LL*ny/5;
             state[3](i,j) = hot ? params::T_init : params::T_0;
         }
@@ -253,7 +260,7 @@ int main(int argc, char* argv[])
 {
     if (argc < 11 || argc > 14) {
         std::cerr << "Usage: " << argv[0]
-            << " Nx Ny Lx Ly T_init T_0 dt output.e|output.csv numSteps stride [viscosity: 0|1] [left_hot_width_nm | --shock-speed D_nm_per_ns | --piston-speed u_nm_per_ns]\n";
+            << " Nx Ny Lx Ly T_init T_0 dt output.e|output.csv numSteps stride [viscosity: 0|1] [left_hot_width_nm | --circular [radius_nm] | --shock-speed D_nm_per_ns | --piston-speed u_nm_per_ns]\n";
         return 1;
     }
     try {
@@ -274,7 +281,18 @@ int main(int argc, char* argv[])
             if (flag != "0" && flag != "1") throw std::invalid_argument("Viscosity must be 0 or 1");
             params::use_artificial_viscosity = flag == "1";
         }
-        if (argc == 14) {
+        if (argc >= 13 && std::string(argv[12]) == "--circular") {
+            circularHotRadiusNm = 0.1*lx; // Match solver2D.C's default circle.
+            if (argc == 14) {
+                std::size_t consumed;
+                const std::string radius(argv[13]);
+                circularHotRadiusNm = std::stod(radius,&consumed);
+                if (consumed != radius.size())
+                    throw std::invalid_argument("Invalid circular hotspot radius");
+            }
+            if (!std::isfinite(circularHotRadiusNm) || circularHotRadiusNm <= 0)
+                throw std::invalid_argument("Circular hotspot radius must be finite and positive");
+        } else if (argc == 14) {
             const std::string mode(argv[12]);
             const std::string speed(argv[13]);
             std::size_t used;
@@ -285,9 +303,12 @@ int main(int argc, char* argv[])
             else if (mode == "--shock-speed") shockSpeed = value;
             else throw std::invalid_argument("Expected --piston-speed or --shock-speed");
         }
-        if (argc == 13) {
-            leftHotWidthNm = std::stod(argv[12]);
-            if (!(leftHotWidthNm > 0 && leftHotWidthNm < lx))
+        else if (argc == 13) {
+            std::size_t consumed;
+            const std::string width(argv[12]);
+            leftHotWidthNm = std::stod(width,&consumed);
+            if (consumed != width.size() || !std::isfinite(leftHotWidthNm)
+                || !(leftHotWidthNm > 0 && leftHotWidthNm < lx))
                 throw std::invalid_argument("Hot width must be between zero and Lx");
         }
         dx = lx/(nx-1);

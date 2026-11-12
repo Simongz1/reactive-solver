@@ -3,11 +3,11 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 meshes = [200, 100, 50]
-dt = 1e-5
+dt = 1e-4
 
 fig, ax = plt.subplots()
 for mesh in meshes:
-    name = f'a{mesh}.csv'
+    name = f'area_fvmechanics.csv'
     data = pd.read_csv(name)
     a = np.array(data['area'])
     t = np.array(data['time'])

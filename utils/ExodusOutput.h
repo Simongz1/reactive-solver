@@ -17,7 +17,8 @@ class ExodusOutput {
     }
 public:
     ExodusOutput(const std::string& path, int nx, int ny, double dx, double dy,
-                 std::vector<std::string> names = {"Y1","Y2","Y3","T"})
+                 std::vector<std::string> names = {"Y1","Y2","Y3","T"},
+                 double originX = 0.0, double originY = 0.0)
         : fields_(static_cast<int>(names.size())) {
         const long long nodes = 1LL * nx * ny;
         const long long cells = 1LL * (nx-1) * (ny-1);
@@ -34,7 +35,7 @@ public:
             std::vector<double> x(nodes_), y(nodes_);
             for (int j=0; j<ny; ++j) for (int i=0; i<nx; ++i) {
                 const int p=j*nx+i;
-                x[p]=i*dx; y[p]=j*dy;
+                x[p]=originX+i*dx; y[p]=originY+j*dy;
             }
             check(ex_put_coord(id_, x.data(), y.data(), nullptr), "write coordinates");
             char xname[]="X", yname[]="Y";

@@ -11,13 +11,13 @@ rerun = input('Run again all cases? (y/n): ')
 dt = [1e-4]
 # Enable a 5,000 nm domain with a 20 nm hot section at the left end.
 long_left_ignition = True
-left_hot_width_nm = 200
-N = [500]
-l = [5000]
+left_hot_width_nm = 100
+N = [1000]
+l = [500]
 T_init = [1920]
 T_0 = [300]
-numSteps = [100000]
-stride = [500]
+numSteps = [10000]
+stride = [50]
 
 def case_filename(n, length, hot, cold, timestep):
     suffix = f"_left{left_hot_width_nm:g}nm" if long_left_ignition else ""
@@ -25,8 +25,8 @@ def case_filename(n, length, hot, cold, timestep):
 
 
 # Profile comparisons: physical times in ns, one panel per requested time.
-profile_variable = "p"  # Y1, Y2, Y3, or T
-profile_times_ns = [0, 0.5, 1, 1.5]
+profile_variable = "T"  # Y1, Y2, Y3, or T
+profile_times_ns = [0, 0.5, 1]
 
 if not profile_times_ns or not all(
     np.isfinite(t) and t >= 0 for t in profile_times_ns
@@ -58,7 +58,7 @@ if (rerun == 'y'):
                 for T in T_init:
                     for T0 in T_0:
                         name = case_filename(n, length, T, T0, time)
-                        subprocess.run(['./mechanics1DFV', 
+                        subprocess.run(['./kinetics1D', 
                                         str(n), 
                                         str(length),
                                         str(T), 
