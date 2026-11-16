@@ -1,8 +1,5 @@
-// Finite-difference kinetics: Y1, Y2, Y3, T, matching solver1D.C.
-//initialize state
-
 #include <cmath>
-#include "modelParams.h"
+#include "modelParams1D.h"
 #include <vector>
 #include <iostream>
 #include "Eigen/Sparse"
@@ -25,6 +22,7 @@ std::vector<Eigen::VectorXd> state = {Y1_old, Y2_old, Y3_old, T_old};
 //location
 Eigen::VectorXd X = Eigen::VectorXd::Zero(params::N);
 
+static double centeredHotWidthNm = 0.0;
 static double leftHotWidthNm = 0.0; // Zero selects the original centered hot region.
 
 void initialConditions(std::vector<Eigen::VectorXd> &state)
@@ -40,7 +38,9 @@ void initialConditions(std::vector<Eigen::VectorXd> &state)
     {
         const bool hot = leftHotWidthNm > 0.0
             ? i * params::dx < leftHotWidthNm
-            : i >= params::highTempStart && i < params::highTempEnd;
+            : centeredHotWidthNm > 0.0
+                ? std::abs(i * params::dx - 0.5 * params::l) <= 0.5 * centeredHotWidthNm
+                : i >= params::highTempStart && i < params::highTempEnd;
         state[3][i] = hot ? T_init : params::T_0;
 
         //other variables remain unchanged
@@ -163,8 +163,8 @@ void RK3Step(std::vector<Eigen::VectorXd>& state)
 
 int main(int argc, char* argv[]){
 
-    if (argc < 9 || argc > 10){
-        std::cerr << "Usage: " << argv[0] << " N l T_init T_0 dt outputFileName numSteps stride [left_hot_width_nm]" << std::endl;
+    if (argc < 12 || argc > 14){
+        std::cerr << "Usage: " << argv[0] << " N l T_init T_0 dt outputFileName numSteps stride k E1 E2 [left_hot_width_nm | --centered-hot-width width_nm]" << std::endl;
         return 1;
     }
 
@@ -177,15 +177,35 @@ int main(int argc, char* argv[]){
         params::outputFileName = std::string(argv[6]);
         params::numSteps = std::stoi(argv[7]);
         params::stride = std::stoi(argv[8]);
+        
+        params::k = std::stod(argv[9]);
+        params::E1 = std::stod(argv[10]);
+        params::E2 = std::stod(argv[11]);
 
-        if (argc == 10) {
+        if (argc == 13) {
             std::size_t consumed;
-            const std::string width(argv[9]);
+            const std::string width(argv[12]);
             leftHotWidthNm = std::stod(width, &consumed);
             if (consumed != width.size() || !std::isfinite(leftHotWidthNm)
                 || leftHotWidthNm <= 0 || leftHotWidthNm >= params::l)
                 throw std::invalid_argument("Require 0 < left_hot_width_nm < domain length");
         }
+
+        if (argc == 14) {
+            if (std::string(argv[12]) != "--centered-hot-width")
+                throw std::invalid_argument("Expected --centered-hot-width width_nm");
+            std::size_t consumed;
+            const std::string width(argv[13]);
+            centeredHotWidthNm = std::stod(width, &consumed);
+            if (consumed != width.size() || !std::isfinite(centeredHotWidthNm)
+                || centeredHotWidthNm <= 0 || centeredHotWidthNm >= params::l)
+                throw std::invalid_argument("Require 0 < centered hot width < domain length");
+        }
+
+        if (!std::isfinite(params::k) || params::k < 0
+            || !std::isfinite(params::E1) || params::E1 < 0
+            || !std::isfinite(params::E2) || params::E2 < 0)
+            throw std::invalid_argument("k, E1 and E2 must be finite and nonnegative");
 
         if (!std::isfinite(params::dt) || params::dt <= 0 || 
             params::N <= 2 || !std::isfinite(params::l) || 

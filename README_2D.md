@@ -282,3 +282,13 @@ of the propagation speed. No radial averaging or enforced symmetry was applied.
 The separate `mechanics2DLevelSet` Cartesian cut-cell prototype transports a circular vacuum
 cavity, supports shock-speed loading on the left, outflow elsewhere, and a finite contact layer
 between opposing cavity surfaces. See [the model, arguments, tests, and limitations](docs/levelset_solver.md).
+
+### Contact-free merging solver
+
+`mechanics2DMerge` uses WENO5/Rusanov fluxes, SSP RK3 transport, active chemistry,
+and a conservative material-fraction formulation with local vacuum-pressure equilibration.
+It has no contact penalty. See [inputs, interface changes, limitations and tests](docs/material_merging.md).
+
+`mechanics2DMergeTHINC` is a separate variant that replaces mixed-cell first-order
+traces with consistent THINC reconstruction; the remaining merging solver is unchanged.
+See [THINC inputs, numerical details and tests](docs/thinc_interface.md).

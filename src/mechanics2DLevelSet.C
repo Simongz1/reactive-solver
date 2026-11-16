@@ -11,6 +11,7 @@
 #include <numeric>
 #include <queue>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 #include "modelParams.h"
@@ -109,8 +110,16 @@ Primitive primitive(const Eigen::VectorXd& U)
     const double dpdrho=Y1*pressure::drho(rho,T,false)+(1-Y1)*pressure::drho(rho,T,true);
     const double dpdT=-Y1*pressure::dT(rho,T,false)-(1-Y1)*pressure::dT(rho,T,true);
     const double c2=dpdrho+T*dpdT*dpdT/(rho*rho*params::cv);
-    if(!std::isfinite(T) || T<=0 || !std::isfinite(p) || !std::isfinite(c2) || c2<0)
-        throw std::runtime_error("Invalid material temperature or sound speed");
+    if(!std::isfinite(T) || T<=0 || !std::isfinite(p) || !std::isfinite(c2) || c2<0) {
+        std::ostringstream message;
+        message << std::setprecision(17)
+            << "Invalid material thermodynamic state: T=" << T << " K, c2=" << c2
+            << ", p=" << p << " GPa, rho=" << rho
+            << ", specific total energy=" << U[6]/rho
+            << ", specific kinetic energy=" << .5*(u*u+v*v)
+            << ", reference energy=" << Y1*referenceEnergy(rho,false)+(1-Y1)*referenceEnergy(rho,true);
+        throw std::runtime_error(message.str());
+    }
     return {rho,T,u,v,p,std::sqrt(c2)};
 }
 Eigen::VectorXd materialState(double rho,double T,double u,double v)
@@ -317,7 +326,16 @@ void validate(const State& state,const Grid& g)
 {
     if(!state.U.allFinite() || !state.phi.allFinite()) throw std::runtime_error("Nonfinite solution");
     const auto geom=levelSet2D::geometry(g,state.phi);
-    for(int p=0;p<g.size();++p) if(geom.fraction[p]>0) primitive(state.U.col(p)/geom.fraction[p]);
+    for(int p=0;p<g.size();++p) if(geom.fraction[p]>0) {
+        try { primitive(state.U.col(p)/geom.fraction[p]); }
+        catch(const std::runtime_error& error) {
+            std::ostringstream message;
+            message << std::setprecision(17) << error.what() << " at cell (" << p%g.nx << ',' << p/g.nx
+                << "), material fraction=" << geom.fraction[p]
+                << ", conserved state=" << state.U.col(p).transpose();
+            throw std::runtime_error(message.str());
+        }
+    }
 }
 State forwardEuler(const State& state,const Grid& g,double dt,const Evaluation& rate)
 {
@@ -413,11 +431,17 @@ int main(int argc,char** argv)
                 const auto rate=evaluate(state,g,settings);
                 double dt=std::min(target-time,rate.stepLimit*.9);
                 bool accepted=false;
+                std::string lastFailure;
                 for(int retry=0;retry<24;++retry) {
                     try {auto candidate=RK3Step(state,g,settings,dt,rate);state=std::move(candidate);accepted=true;break;}
-                    catch(const std::runtime_error&) {dt*=.5;}
+                    catch(const std::runtime_error& error) {lastFailure=error.what();dt*=.5;}
                 }
-                if(!accepted || dt<1e-14*interval) throw std::runtime_error("Cannot advance an admissible interface state; refine the mesh or revise contact parameters");
+                if(!accepted || dt<1e-14*interval) {
+                    std::ostringstream message;
+                    message << std::setprecision(17) << "Cannot advance an admissible interface state at time "
+                        << time << " ns, next dt=" << dt << " ns. Last rejected stage: " << lastFailure;
+                    throw std::runtime_error(message.str());
+                }
                 time+=dt;
             }
             if(step%stride==0 || step==steps) save(step,time);

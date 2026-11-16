@@ -1,0 +1,4 @@
+#/bin/bash -l
+times = 
+scp gonz1075@negishi.rcac.purdue.edu:/scratch/negishi/gonz1075/mist2/sakano_proof/comparison/*.png ./
+open ./*.png

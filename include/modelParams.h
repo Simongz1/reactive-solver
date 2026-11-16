@@ -18,6 +18,18 @@ namespace params{
     inline unsigned int stride;
 
     inline bool use_artificial_viscosity;
+    // inline bool default_E1;
+    // inline bool default_E2;
+    // inline bool default_k;
+    // inline double *k = nullptr;
+    // inline double *E1 = nullptr;
+    // inline double *E2 = nullptr;
+
+    // inline void defaultKinetics(){
+    //     E1 = default_E1 ? 24400.0 : E1;
+    //     E2 = default_E2 ? 23500.0 : E2;
+    //     k = default_k ? 0.361 : k;
+    // }
 
     inline void update(){
         dx = l / (N - 1);
