@@ -1,0 +1,3 @@
+NetCDF-C v4.9.3
+SEACAS 1020bc1dd15c658ed7127cd4bf9de192f2198a53
+Static arm64 macOS build; NetCDF classic/64-bit-offset.
