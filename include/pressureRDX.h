@@ -2,7 +2,7 @@
 #include <cmath>
 #include "modelParams.h"
 
-namespace pressure{
+namespace pressureRDX{
 
     inline double value(double rho, double T, bool reacted){
         //computes temperature dependent JWL pressure

@@ -79,4 +79,25 @@ namespace params{
     const double C0 = 0.1;
     const double C1 = 2.0;
     const double ss = std::sqrt(20.1 / rho_init);
+
+    //polystyrene parameters:
+    const double E = 0.001;
+    const double nu = 0.35;
+    const double G = E / (3.0 * (1.0 - 2.0 * nu));
+    const double K = 3.0 * G * (1.0 + nu) / (3 * (1.0 - 2.0 * nu));
+
+    // Multimaterial thermal parameters (J/kg-K; rho in solver units).
+    const double rho_ps = 1020e-9;
+    const double cv_ps = 3000;
+    const double cv_air = 1000;
+    const double R_air = 287;
+
+    //plasticity parametere
+    const double A_rdx = 0.2;
+    const double B_rdx = 0.3;
+    const double ref_ep = 1e-6;
+    const double n_rdx = 0.1;
+    const double m_rdx = 3;
+    const double C_rdx = 0.1;
+    const double Tm_rdx = 512.0;
 }

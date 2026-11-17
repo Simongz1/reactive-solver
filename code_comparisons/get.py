@@ -8,10 +8,10 @@ import pandas as pd
 # Input numbers are MOOSE timestep numbers, not physical times or FD steps.
 dt_moose = 1e-4
 dt_fd = 1e-4
-elements = 100
-fd_nodes = 200  # FD node count; separate from MOOSE element count.
-centered_hot_width_nm = 10.0
-length = 100
+elements = 10
+fd_nodes = 10  # FD node count; separate from MOOSE element count.
+centered_hot_width_nm = 2000
+length = 10000
 E1 = 24400
 E2 = 23500
 k = 0.361

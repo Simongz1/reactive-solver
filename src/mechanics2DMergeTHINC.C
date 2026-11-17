@@ -18,6 +18,7 @@
 #include "computeReactionRates.h"
 #include "WENO.h"
 #include "THINC.h"
+#include "densityMap2D.h"
 #include "riemannMaterial2D.h"
 #include "levelSet2D.h"
 #include "ExodusOutput.h"
@@ -31,6 +32,7 @@ struct Settings {
     bool reactions = true;
     bool conduction = true;
     Cell inlet = Cell::Zero();
+    std::vector<Cell> inletRows; // Optional mapped upstream state for each inlet row.
     bool driven = false;
     double thincBeta = 1.6; //default value
 };
@@ -97,6 +99,43 @@ ShockState downstreamState(double speed)
     if (!(temperature >= 300 && std::isfinite(temperature) && std::isfinite(pressureBehind)))
         throw std::invalid_argument("Shock solution has invalid temperature or pressure");
     return {rho,speed*eta,temperature,pressureBehind};
+}
+
+// Rankine-Hugoniot solve for arbitrary mapped intrinsic upstream density.
+// The EOS reference density remains a material constant.
+ShockState downstreamMappedState(double speed,double rho0)
+{
+    if(rho0==params::rho_init)return downstreamState(speed);
+    const double T0=300, cv=params::cv;
+    const double p0=-pressure::value(rho0,T0,false);
+    const double e0=cv*T0+referenceEnergy(rho0,false);
+    const double pT=-pressure::dT(rho0,T0,false);
+    const double c2=pressure::drho(rho0,T0,false)+T0*pT*pT/(rho0*rho0*cv);
+    if(!std::isfinite(c2) || c2<0 || speed*speed<=c2)
+        throw std::invalid_argument("Shock speed must exceed local upstream sound speed in density map");
+    auto stateAt=[&](double eta) {
+        const double rho=rho0/(1-eta),p=p0+rho0*speed*speed*eta;
+        const double T=(e0+.5*(p+p0)*eta/rho0-referenceEnergy(rho,false))/cv;
+        return ShockState{rho,speed*eta,T,p};
+    };
+    auto mismatch=[&](double eta) {
+        const auto q=stateAt(eta);
+        return -pressure::value(q.density,q.temperature,false)-q.pressure;
+    };
+    double low=1e-8,high=low;
+    if(!(mismatch(low)<0))throw std::invalid_argument("Cannot bracket mapped compressive shock");
+    bool bracket=false;
+    for(int n=1;n<=10000;++n){high=.999*n/10000;
+        const double f=mismatch(high);
+        if(!std::isfinite(f))break;
+        if(f>0){bracket=true;break;}low=high;
+    }
+    if(!bracket)throw std::invalid_argument("No admissible mapped shock root found");
+    for(int n=0;n<80;++n){double mid=.5*(low+high);if(mismatch(mid)>0)high=mid;else low=mid;}
+    const auto q=stateAt(.5*(low+high));
+    if(!std::isfinite(q.temperature) || q.temperature<=0)
+        throw std::invalid_argument("Mapped shock temperature is invalid");
+    return q;
 }
 
 Primitive primitive(const Eigen::VectorXd& U)
@@ -238,12 +277,15 @@ Evaluation evaluate(const State& s,const Grid& g,const Settings& settings,bool h
             owner[r]=owner[p];pending.push(r);
         }
     }
-    Primitive inlet{};if(settings.driven) inlet=decode(settings.inlet);
+    auto inletCell=[&](int j)->const Cell& {
+        return settings.inletRows.empty()?settings.inlet:settings.inletRows.at(std::clamp(j,0,g.ny-1));
+    };
     auto sample=[&](int i,int j)->Cell {
-        if(i<0 && settings.driven) return settings.inlet;
+        if(i<0 && settings.driven) return inletCell(j);
         return s.col(g.index(std::clamp(i,0,g.nx-1),std::clamp(j,0,g.ny-1)));
     };
     auto face=[&](int i,int j,bool x) {
+        const Primitive inlet=settings.driven?decode(inletCell(j)):Primitive{};
         std::array<std::array<double,6>,8> stencil;
         for(int n=0;n<6;++n) {
             const Cell value=sample(i+(x?n-3:0),j+(x?0:n-3));
@@ -309,7 +351,7 @@ Evaluation evaluate(const State& s,const Grid& g,const Settings& settings,bool h
         Cell F=.5*(fl+fr)-.5*speed*(right-left);
         // Centered heat stencil, zero heat flux into exact vacuum. Use cell
         // temperatures rather than two traces at the same reconstructed point.
-        const double al=(x && i==0 && settings.driven)?1:s(7,l),ar=s(7,r);
+        const double al=(x && i==0 && settings.driven)?inletCell(j)[7]:s(7,l),ar=s(7,r);
         const double conductivity=(settings.conduction && al>0 && ar>0)?2*al*ar/(al+ar)*params::k:0;
         F[6]-=conductivity*(q[r].T-((x && i==0 && settings.driven)?inlet.T:q[l].T))/(x?g.dx():g.dy());
         const double spacing=x?g.dx():g.dy();
@@ -371,45 +413,75 @@ Step RK3Step(const State& s,const Grid& g,const Settings& settings,double dt,boo
 
 #ifndef MECHANICS2DMERGETHINC_NO_MAIN
 int main(int argc,char** argv) {
-    if(argc!=11 && argc!=12 && argc!=13) {
-        std::cerr<<"Usage: "<<argv[0]<<" Nx Ny Lx Ly dt output.e|csv numSteps stride shock_speed_nm_ns cavity_radius_nm [--thinc-beta value | --riemann]\n"
+    if(argc<11) {
+        std::cerr<<"Usage: "<<argv[0]<<" Nx Ny Lx Ly dt output.e|csv numSteps stride shock_speed_nm_ns cavity_radius_nm [--thinc-beta value] [--density-map file.csv | --riemann]\n"
             <<"Chemistry is enabled. No contact parameters.\n";return 1;
     }
     try {
         Grid g{std::stoi(argv[1]),std::stoi(argv[2]),std::stod(argv[3]),std::stod(argv[4])};
         const double interval=std::stod(argv[5]),speed=std::stod(argv[9]),radius=std::stod(argv[10]);
         const int steps=std::stoi(argv[7]),stride=std::stoi(argv[8]);
-        const bool riemann=argc==12 && std::string(argv[11])=="--riemann";
-        for(double value:{g.lx,g.ly,interval,speed,radius}) if(!std::isfinite(value)) throw std::invalid_argument("Inputs must be finite");
-        if(g.nx<6 || g.ny<6 || g.lx<=0 || g.ly<=0 || interval<=0 || speed<0 || (!riemann && (radius<=0
-            || radius>=std::min(.25*g.lx,.5*g.ly))) || steps<0 || stride<1) throw std::invalid_argument("Invalid inputs: pore radius must be less than min(Lx/4, Ly/2)");
-        Settings settings;
-        if(argc==12 && !riemann)throw std::invalid_argument("Expected --riemann");
+        bool riemann=false;std::string densityPath;Settings settings;
+        for(int a=11;a<argc;++a) {
+            const std::string flag=argv[a];
+            if(flag=="--riemann")riemann=true;
+            else if(flag=="--density-map" && a+1<argc)densityPath=argv[++a];
+            else if(flag=="--thinc-beta" && a+1<argc) {
+                std::size_t consumed;const std::string value=argv[++a];
+                settings.thincBeta=std::stod(value,&consumed);
+                if(consumed!=value.size())throw std::invalid_argument("Invalid THINC beta");
+            } else throw std::invalid_argument("Unknown or incomplete option: "+flag);
+        }
+        if(riemann && !densityPath.empty())throw std::invalid_argument("Density map and Riemann mode are mutually exclusive");
+        for(double value:{g.lx,g.ly,interval,speed,radius})if(!std::isfinite(value))throw std::invalid_argument("Inputs must be finite");
+        if(g.nx<6 || g.ny<6 || g.lx<=0 || g.ly<=0 || interval<=0 || speed<0 || steps<0 || stride<1)
+            throw std::invalid_argument("Invalid grid or time inputs");
+        if(!riemann && densityPath.empty() && (radius<=0 || radius>=std::min(.25*g.lx,.5*g.ly)))
+            throw std::invalid_argument("Pore radius must be less than min(Lx/4,Ly/2)");
+        if(!std::isfinite(settings.thincBeta) || settings.thincBeta<=0 || settings.thincBeta>10)
+            throw std::invalid_argument("Require finite 0 < thinc-beta <= 10");
         if(riemann){settings.reactions=false;settings.conduction=false;}
-        if(argc==13) {
-            if(std::string(argv[11])!="--thinc-beta")throw std::invalid_argument("Expected --thinc-beta value");
-            std::size_t consumed=0;const std::string value=argv[12];
-            settings.thincBeta=std::stod(value,&consumed);
-            if(consumed!=value.size() || !std::isfinite(settings.thincBeta)
-                || settings.thincBeta<=0 || settings.thincBeta>10)
-                throw std::invalid_argument("Require finite 0 < thinc-beta <= 10");
+        Eigen::VectorXd mappedDensity;
+        if(!densityPath.empty()) {
+            const auto map=densityMap2D::read(densityPath);mappedDensity.resize(g.size());
+            for(int j=0;j<g.ny;++j)for(int i=0;i<g.nx;++i)
+                mappedDensity[g.index(i,j)]=map.at((i+.5)*g.dx(),(j+.5)*g.dy());
+            if(mappedDensity.maxCoeff()==0)throw std::invalid_argument("Density map contains no material on FV grid");
+            std::cout<<"Loaded intrinsic density map "<<densityPath<<" (nearest neighbor)\n";
         }
         std::cout<<"THINC beta "<<settings.thincBeta<<'\n';
-        if(speed>0 && !riemann) {
+        if(speed>0 && !riemann && densityPath.empty()) {
             const auto shock=downstreamState(speed);settings.driven=true;
             settings.inlet=mixture(1,shock.density,shock.temperature,shock.velocity,0);
             std::cout<<"Shock speed "<<speed<<", particle speed "<<shock.velocity<<", pressure "<<shock.pressure<<" GPa\n";
         }
+        if(speed>0 && !densityPath.empty()) {
+            settings.driven=true;settings.inletRows.resize(g.ny,Cell::Zero());
+            for(int j=0;j<g.ny;++j) {
+                const double rho0=mappedDensity[g.index(0,j)];
+                if(rho0==0)continue;
+                const auto shock=downstreamMappedState(speed,rho0);
+                settings.inletRows[j]=mixture(1,shock.density,shock.temperature,shock.velocity,0);
+                decode(settings.inletRows[j]);
+            }
+        }
         // Geometric fraction is used ONCE to initialize the circle, never to
         // remap an evolved conserved state or remove its mass/energy.
         Eigen::VectorXd fractions=Eigen::VectorXd::Ones(g.size());
-        if(!riemann) fractions=levelSet2D::geometry(g,levelSet2D::circle(g,g.lx/4,g.ly/2,radius)).fraction;
+        if(!riemann && densityPath.empty()) fractions=levelSet2D::geometry(g,levelSet2D::circle(g,g.lx/4,g.ly/2,radius)).fraction;
         State state(8,g.size());
         for(int p=0;p<g.size();++p) {
             double alpha=fractions[p];
             // Remove polygon roundoff only in the initial geometry.
             if(alpha<1e-12)alpha=0;if(alpha>1-1e-12)alpha=1;
             state.col(p)=mixture(alpha,params::rho_init,300,0,0);
+            if(!densityPath.empty()) {
+                const double rho=mappedDensity[p];
+                state.col(p)=rho==0?Cell::Zero():mixture(1,rho,300,0,0);
+                try{decode(state.col(p));}catch(const std::exception& e){
+                    throw std::invalid_argument("Invalid mapped state at cell ("+std::to_string(p%g.nx)+","+std::to_string(p/g.nx)+"): "+e.what());
+                }
+            }
             if(riemann) {
                 const auto q=riemannMaterial2D::at((p%g.nx+.5)*g.dx()/g.lx,(p/g.nx+.5)*g.dy()/g.ly);
                 state.col(p)=mixture(1,q.rhoRatio*params::rho_init,q.T,q.u,q.v);
