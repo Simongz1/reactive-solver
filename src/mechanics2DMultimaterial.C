@@ -50,6 +50,8 @@ struct Primitive
 struct Settings
 {
     bool reactions = true, conduction = true;
+    bool openBoundaries = false;
+    std::vector<int> fixedCells; // Stationary end-support cells selected at initialization.
     double thincBeta = 1.6;
     double pistonVelocity = 0; // Constant laboratory velocity of translating mesh/wall.
 };
@@ -154,12 +156,12 @@ Cell makeState(const std::array<double, 3> &alpha, const std::array<double, 3> &
     decode(U);
     return U;
 }
-Cell pureState(int phase, double rho, double T = 300, double u = 0)
+Cell pureState(int phase, double rho, double T = 300, double u = 0, double v = 0)
 {
     std::array<double, 3> alpha{}, density{};
     alpha[phase] = 1;
     density[phase] = rho;
-    return makeState(alpha, density, T, u);
+    return makeState(alpha, density, T, u, v);
 }
 void validate(const State &state, const Grid &grid)
 {
@@ -257,7 +259,7 @@ Evaluation evaluate(const State &state, const Grid &grid, const Settings &settin
     }
     auto sample = [&](int i, int j) -> Cell
     {
-        if (i < 0) {
+        if (i < 0 && !settings.openBoundaries) {
             const Cell interior = state.col(grid.index(std::clamp(-i-1,0,grid.nx-1),std::clamp(j,0,grid.ny-1)));
             const auto q = decode(interior);
             Cell ghost = interior;
@@ -298,7 +300,7 @@ Evaluation evaluate(const State &state, const Grid &grid, const Settings &settin
         fluxL[TotalEnergy] += uL * qL.p;
         fluxR[TotalEnergy] += uR * qR.p;
         Cell flux = .5 * (fluxL + fluxR) - .5 * speed * (right - left);
-        const bool pistonFace = alongX && i==0;
+        const bool pistonFace = alongX && i == 0 && !settings.openBoundaries;
         if (pistonFace) {
             // Impermeable, adiabatic slip wall. Rusanov reflected-state traction;
             // impose exact mechanical work p_wall * v_piston, not ghost energy mixing.
@@ -379,22 +381,37 @@ struct Step
 Step RK3Step(const State &initial, const Grid &grid, const Settings &settings, double dt,
              bool highOrder, const Evaluation &r0)
 {
-    auto advance = [&](const State &state, const Evaluation &rate) -> State
+    Conserved supportExchange = Conserved::Zero();
+    auto advance = [&](const State &state, const Evaluation &rate, double weight) -> State
     {
         if (dt > rate.stepLimit * (1 + 1e-12))
             throw std::runtime_error("Stage CFL/source limit exceeded");
         State next = state + dt * rate.rhs;
+        // The stationary support removes mechanical work; it does not heat the film.
+        for (int cell : settings.fixedCells)
+        {
+            const double rho = next(AlphaRhoRDX,cell) + next(AlphaRhoPS,cell) + next(AlphaRhoPore,cell);
+            if (rho <= 0) throw std::runtime_error("Invalid density at support");
+            const double mx = next(MomentumX,cell), my = next(MomentumY,cell);
+            const double kinetic = .5*(mx*mx+my*my)/rho;
+            next(MomentumX,cell) = next(MomentumY,cell) = 0;
+            next(TotalEnergy,cell) -= kinetic;
+            const double volumeWeight = weight*grid.dx()*grid.dy();
+            supportExchange[MomentumX] -= volumeWeight*mx;
+            supportExchange[MomentumY] -= volumeWeight*my;
+            supportExchange[TotalEnergy] -= volumeWeight*kinetic;
+        }
         validate(next, grid);
         return next;
     };
-    const State stage1 = advance(initial, r0);
+    const State stage1 = advance(initial, r0, 1.0/6);
     const auto r1 = evaluate(stage1, grid, settings, highOrder);
-    const State stage2 = .75 * initial + .25 * advance(stage1, r1);
+    const State stage2 = .75 * initial + .25 * advance(stage1, r1, 1.0/6);
     validate(stage2, grid);
     const auto r2 = evaluate(stage2, grid, settings, highOrder);
-    State finalState = initial / 3 + (2.0 / 3) * advance(stage2, r2);
+    State finalState = initial / 3 + (2.0 / 3) * advance(stage2, r2, 2.0/3);
     validate(finalState, grid);
-    return {std::move(finalState), dt * (r0.boundary / 6 + r1.boundary / 6 + 2 * r2.boundary / 3),
+    return {std::move(finalState), dt * (r0.boundary / 6 + r1.boundary / 6 + 2 * r2.boundary / 3) + supportExchange,
             dt * (r0.reactionHeat / 6 + r1.reactionHeat / 6 + 2 * r2.reactionHeat / 3),
             r0.faceFallbacks + r1.faceFallbacks + r2.faceFallbacks};
 }
@@ -406,7 +423,7 @@ int main(int argc, char **argv)
     {
         std::cerr << "Usage: " << argv[0]
                   << " Nx Ny Lx Ly dt output.e|csv steps stride piston_velocity radius [--density-map "
-                     "x_y_rho_phase.csv] [--thinc-beta value] [--no-chemistry] [--no-conduction]\n";
+                     "x_y_rho_phase.csv] [--thinc-beta value] [--no-chemistry] [--no-conduction] [--rdx-velocity vx vy] [--open-boundaries] [--fixed-ps-ends width]\n";
         return 1;
     }
     try
@@ -419,6 +436,7 @@ int main(int argc, char **argv)
         const std::string outputPath = argv[6];
         std::string mapPath;
         Settings settings;
+        double rdxVx = 0, rdxVy = 0, supportWidth = 0;
         for (int a = 11; a < argc; ++a)
         {
             const std::string option = argv[a];
@@ -426,6 +444,15 @@ int main(int argc, char **argv)
                 mapPath = argv[++a];
             else if (option == "--thinc-beta" && a + 1 < argc)
                 settings.thincBeta = std::stod(argv[++a]);
+            else if (option == "--rdx-velocity" && a + 2 < argc)
+            {
+                rdxVx = std::stod(argv[++a]);
+                rdxVy = std::stod(argv[++a]);
+            }
+            else if (option == "--fixed-ps-ends" && a + 1 < argc)
+                supportWidth = std::stod(argv[++a]);
+            else if (option == "--open-boundaries")
+                settings.openBoundaries = true;
             else if (option == "--no-chemistry")
                 settings.reactions = false;
             else if (option == "--no-conduction")
@@ -433,13 +460,19 @@ int main(int argc, char **argv)
             else
                 throw std::invalid_argument("Unknown/incomplete option: " + option);
         }
-        for (double value : {grid.lx, grid.ly, interval, pistonVelocity, radius, settings.thincBeta})
+        for (double value : {grid.lx, grid.ly, interval, pistonVelocity, radius, settings.thincBeta, rdxVx, rdxVy, supportWidth})
             if (!std::isfinite(value))
                 throw std::invalid_argument("Nonfinite input");
         if (grid.nx < 6 || grid.ny < 6 || grid.lx <= 0 || grid.ly <= 0 || interval <= 0 ||
             pistonVelocity < 0 || steps < 0 || stride < 1 || settings.thincBeta <= 0 ||
             settings.thincBeta > 10)
             throw std::invalid_argument("Invalid grid/time/THINC parameters");
+        if ((settings.openBoundaries || supportWidth > 0) && pistonVelocity != 0)
+            throw std::invalid_argument("Open boundaries/supports require zero piston velocity");
+        if (supportWidth < 0 || supportWidth >= grid.lx/2)
+            throw std::invalid_argument("Invalid support width");
+        if (mapPath.empty() && (rdxVx != 0 || rdxVy != 0 || supportWidth > 0))
+            throw std::invalid_argument("Impact velocity/supports require a phase density map");
         State state(stateFieldCount, grid.size());
         std::vector<int> phases(grid.size(), 0);
         Eigen::VectorXd densities = Eigen::VectorXd::Constant(grid.size(), params::rho_init);
@@ -456,7 +489,11 @@ int main(int argc, char **argv)
                     if (densities[cell] <= 0)
                         throw std::invalid_argument(
                             "All phases, including pore air, require positive CSV density");
-                    state.col(cell) = pureState(phases[cell], densities[cell]);
+                    state.col(cell) = pureState(phases[cell], densities[cell], 300,
+                                               phases[cell] == 0 ? rdxVx : 0,
+                                               phases[cell] == 0 ? rdxVy : 0);
+                    if (phases[cell] == 1 && (x < supportWidth || x > grid.lx-supportWidth))
+                        settings.fixedCells.push_back(cell);
                 }
         }
         else
@@ -474,9 +511,12 @@ int main(int argc, char **argv)
                                             300);
             }
         }
+        if (supportWidth > 0 && settings.fixedCells.empty())
+            throw std::invalid_argument("No PS cells found in end-support strips");
         validate(state, grid);
         settings.pistonVelocity = pistonVelocity;
-        std::cout << "Piston velocity " << pistonVelocity << " nm/ns; translating mesh, impermeable left wall\n";
+        if (settings.openBoundaries) std::cout << "Stationary mesh, open boundaries; support cells " << settings.fixedCells.size() << "\n";
+        else std::cout << "Piston velocity " << pistonVelocity << " nm/ns; translating mesh, impermeable left wall\n";
         const std::vector<std::string> names = {"Y1",
                                                 "Y2",
                                                 "Y3",
