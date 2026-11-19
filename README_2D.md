@@ -292,3 +292,29 @@ It has no contact penalty. See [inputs, interface changes, limitations and tests
 `mechanics2DMergeTHINC` is a separate variant that replaces mixed-cell first-order
 traces with consistent THINC reconstruction; the remaining merging solver is unchanged.
 See [THINC inputs, numerical details and tests](docs/thinc_interface.md).
+
+## Multithreaded (OpenMP) multimaterial solver
+
+`mechanics2DMultimaterialOMP` is `src/mechanics2DMultimaterial.C` built with OpenMP; arguments and output are unchanged.
+
+```sh
+./build/build2D.sh mechanics2DMultimaterialOMP
+OMP_NUM_THREADS=16 ./mechanics2DMultimaterialOMP 250 250 250 250 1e-5 phases.e 100000 250 7000 0 --density-map phases.csv
+```
+
+Cell decoding, face fluxes, the flux gather into each cell, chemistry, state validation and output decoding run in parallel. Each face flux is computed independently and each cell then sums its own four faces in the serial order, so there are no write conflicts; time-step limits, boundary fluxes and heat release are reduced afterwards in serial order. Threaded output is therefore bit-identical to the serial build for any thread count. The plain `mechanics2DMultimaterial` target compiles the same source without OpenMP. On macOS the script uses Homebrew `libomp` with Apple clang; on Linux it adds `-fopenmp`. In a Slurm job, request one task with `--cpus-per-task=N` and set `OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK`.
+
+### Low-order fallback (multimaterial solver)
+
+When a WENO5/THINC step fails (an invalid cell state or a stage CFL/source limit), the
+solver first retries the same high-order step at `dt/2, dt/4, ..., dt/2^N`
+(`--high-order-halvings N`, default 3; `0` skips straight to the local fallback). If that
+still fails, it flags only the cells that failed and uses first-order Rusanov states on
+their faces, widening to the 3x3 neighbourhood if a flagged cell fails again. The rest of
+the domain keeps WENO/THINC, and the update stays conservative. A global first-order step
+is used only if the local fallback also fails at every `dt`.
+
+Diagnostics columns: `low_order_steps` counts steps that needed the local fallback,
+`low_order_cells` is the cumulative number of flagged cell-steps, and
+`global_low_order_steps` counts the last-resort global first-order steps. `retries` now
+counts every failed attempt.

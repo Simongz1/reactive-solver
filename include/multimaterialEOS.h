@@ -17,16 +17,18 @@ enum Phase
     PS = 1,
     Air = 2
 };
+
 const double rhoPS = params::rho_ps;
 const double cvPS = params::cv_ps;
 const double cvAir = params::cv_air;
 const double gasConstantAir = params::R_air;
 constexpr double defaultAirDensity = 1.2e-9;
+
 inline double heatCapacity(int phase)
 {
     return phase == RDX ? params::cv : phase == PS ? cvPS : cvAir;
 }
-// All pressures here are compression-positive. The legacy RDX value() is stress.
+
 inline double pressureValue(int phase, double rho, double T, double Y1 = 1)
 {
     if (phase == RDX)

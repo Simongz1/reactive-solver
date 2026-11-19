@@ -18,18 +18,6 @@ namespace params{
     inline unsigned int stride;
 
     inline bool use_artificial_viscosity;
-    // inline bool default_E1;
-    // inline bool default_E2;
-    // inline bool default_k;
-    // inline double *k = nullptr;
-    // inline double *E1 = nullptr;
-    // inline double *E2 = nullptr;
-
-    // inline void defaultKinetics(){
-    //     E1 = default_E1 ? 24400.0 : E1;
-    //     E2 = default_E2 ? 23500.0 : E2;
-    //     k = default_k ? 0.361 : k;
-    // }
 
     inline void update(){
         dx = l / (N - 1);
@@ -85,6 +73,21 @@ namespace params{
     const double nu = 0.35;
     const double G = E / (3.0 * (1.0 - 2.0 * nu));
     const double K = 3.0 * G * (1.0 + nu) / (3 * (1.0 - 2.0 * nu));
+
+    //shear modulus of polystyrene, G = E / (2(1 + nu)) (used by the Lipit solver)
+    //note: G and K above are not the standard isotropic relations
+    //(K should be E / (3(1 - 2 nu))); they are left unchanged because pressurePS uses K
+    const double G_ps = E / (2.0 * (1.0 + nu));
+    //polystyrene yield stress (GPa), perfectly plastic. PLACEHOLDER: set your value
+    const double Y_ps = 0.05;
+
+    //RDX shear modulus (GPa). PLACEHOLDER: set your value
+    const double G_rdx = 3.0;
+
+    //add parameters for the flyer
+    const double K_flyer = 400;
+    const double nu_flyer = 0.3;
+    const double G_flyer = 3.0 * K_flyer * (1.0 - 2.0 * nu_flyer) / (2.0 * (1.0 + nu_flyer));
 
     // Multimaterial thermal parameters (J/kg-K; rho in solver units).
     const double rho_ps = 1020e-9;

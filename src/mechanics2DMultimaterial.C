@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -20,8 +21,46 @@
 #include "WENO.h"
 #include "THINC.h"
 #include "ExodusOutput.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using Grid = levelSet2D::Grid;
+
+// Runs body(index) for every index in [0, count). Built with OpenMP, iterations
+// are shared among threads; each iteration must only write its own outputs.
+// An exception from any iteration is rethrown after the loop, taking the lowest
+// failing index so the error (and the retry it triggers) matches a serial run.
+template <class Body>
+void parallelFor(int count, const Body &body)
+{
+#ifdef _OPENMP
+    std::exception_ptr error;
+    int errorIndex = count;
+#pragma omp parallel for schedule(static)
+    for (int index = 0; index < count; ++index)
+    {
+        try
+        {
+            body(index);
+        }
+        catch (...)
+        {
+#pragma omp critical(parallelForError)
+            if (index < errorIndex)
+            {
+                errorIndex = index;
+                error = std::current_exception();
+            }
+        }
+    }
+    if (error)
+        std::rethrow_exception(error);
+#else
+    for (int index = 0; index < count; ++index)
+        body(index);
+#endif
+}
 enum Field
 {
     Species1Mass = 0,
@@ -54,6 +93,9 @@ struct Settings
     std::vector<int> fixedCells; // Stationary end-support cells selected at initialization.
     double thincBeta = 1.6;
     double pistonVelocity = 0; // Constant laboratory velocity of translating mesh/wall.
+    // A failed high-order step is retried at dt/2, ..., dt/2^N before falling
+    // back to local first-order fluxes around the cells that failed.
+    int highOrderHalvings = 3;
 };
 
 // Decode phase densities from PARTIAL masses and volume fractions. Species are
@@ -165,7 +207,8 @@ Cell pureState(int phase, double rho, double T = 300, double u = 0, double v = 0
 }
 void validate(const State &state, const Grid &grid)
 {
-    for (int cell = 0; cell < grid.size(); ++cell)
+    parallelFor(grid.size(), [&](int cell)
+    {
         try
         {
             decode(state.col(cell));
@@ -176,6 +219,7 @@ void validate(const State &state, const Grid &grid)
                                      std::to_string(cell % grid.nx) + "," +
                                      std::to_string(cell / grid.nx) + ")");
         }
+    });
 }
 
 struct Evaluation
@@ -241,22 +285,32 @@ std::pair<Cell, Cell> reconstruct(const std::array<Cell, 6> &cells, bool highOrd
     return {left, right};
 }
 
+// lowOrderCells (optional, one flag per cell): every face touching a flagged
+// cell uses first-order (cell-average) Rusanov states; all others stay WENO/THINC.
 Evaluation evaluate(const State &state, const Grid &grid, const Settings &settings,
-                    bool highOrder = true)
+                    bool highOrder = true, const std::vector<char> *lowOrderCells = nullptr)
 {
+    // Parallel structure: (1) decode every cell, (2) compute every face flux
+    // independently, (3) gather fluxes into each cell's rhs, (4) local chemistry.
+    // No step writes to memory owned by another iteration, and every reduction
+    // (time-step limit, boundary fluxes, heat release) is done afterwards in the
+    // serial order, so threaded and serial runs give bit-identical results.
     Evaluation result;
-    result.rhs = State::Zero(stateFieldCount, grid.size());
+    result.rhs.resize(stateFieldCount, grid.size()); // zeroed per cell in the gather
     std::vector<Primitive> primitive(grid.size());
-    double inverseDt = 0;
-    for (int cell = 0; cell < grid.size(); ++cell)
+    std::vector<double> cellInverseDt(grid.size());
+    parallelFor(grid.size(), [&](int cell)
     {
         const auto q = decode(state.col(cell));
         primitive[cell] = q;
-        inverseDt = std::max(inverseDt,
-                             (std::abs(q.u - settings.pistonVelocity) + q.c) / grid.dx() + (std::abs(q.v) + q.c) / grid.dy() +
-                                 2 * (settings.conduction ? params::k : 0) / q.heatCapacityVolume *
-                                     (1 / (grid.dx() * grid.dx()) + 1 / (grid.dy() * grid.dy())));
-    }
+        cellInverseDt[cell] =
+            (std::abs(q.u - settings.pistonVelocity) + q.c) / grid.dx() + (std::abs(q.v) + q.c) / grid.dy() +
+            2 * (settings.conduction ? params::k : 0) / q.heatCapacityVolume *
+                (1 / (grid.dx() * grid.dx()) + 1 / (grid.dy() * grid.dy()));
+    });
+    double inverseDt = 0;
+    for (double value : cellInverseDt)
+        inverseDt = std::max(inverseDt, value);
     auto sample = [&](int i, int j) -> Cell
     {
         if (i < 0 && !settings.openBoundaries) {
@@ -270,14 +324,31 @@ Evaluation evaluate(const State &state, const Grid &grid, const Settings &settin
         }
         return state.col(grid.index(std::clamp(i, 0, grid.nx - 1), std::clamp(j, 0, grid.ny - 1)));
     };
-    auto face = [&](int i, int j, bool alongX)
+    // A face flux depends only on the six cells across it, so faces are computed
+    // independently and stored; nothing is accumulated inside this function.
+    // No default member values: the face arrays are allocated without a serial
+    // initialization pass, and every field is written by face() in parallel.
+    struct FaceFlux
     {
+        Cell flux;
+        double velocity, inverseDt;
+        bool fallback;
+    };
+    auto face = [&](int i, int j, bool alongX) -> FaceFlux
+    {
+        FaceFlux result;
+        result.fallback = false;
         std::array<Cell, 6> cells;
         for (int n = 0; n < 6; ++n)
             cells[n] = sample(i + (alongX ? n - 3 : 0), j + (alongX ? 0 : n - 3));
         const bool interior = alongX ? i >= 3 && i <= grid.nx - 3 : j >= 3 && j <= grid.ny - 3;
         Cell left = cells[2], right = cells[3];
-        if (highOrder && interior)
+        // Interior faces always have both neighbouring cells inside the grid.
+        const bool locallyLowOrder =
+            lowOrderCells && interior &&
+            ((*lowOrderCells)[alongX ? grid.index(i - 1, j) : grid.index(i, j - 1)] ||
+             (*lowOrderCells)[grid.index(i, j)]);
+        if (highOrder && interior && !locallyLowOrder)
             try
             {
                 auto traces = reconstruct(cells, true, settings.thincBeta);
@@ -286,14 +357,14 @@ Evaluation evaluate(const State &state, const Grid &grid, const Settings &settin
             }
             catch (const std::runtime_error &)
             {
-                ++result.faceFallbacks;
+                result.fallback = true;
             }
         const auto qL = decode(left), qR = decode(right);
         const double uL = alongX ? qL.u : qL.v, uR = alongX ? qR.u : qR.v;
         const double meshVelocity = alongX ? settings.pistonVelocity : 0;
         const double speed = std::max(std::abs(uL-meshVelocity) + qL.c, std::abs(uR-meshVelocity) + qR.c);
         const double spacing = alongX ? grid.dx() : grid.dy();
-        inverseDt = std::max(inverseDt, 2 * speed / spacing);
+        result.inverseDt = 2 * speed / spacing;
         Cell fluxL = (uL-meshVelocity) * left, fluxR = (uR-meshVelocity) * right;
         fluxL[alongX ? MomentumX : MomentumY] += qL.p;
         fluxR[alongX ? MomentumX : MomentumY] += qR.p;
@@ -311,64 +382,113 @@ Evaluation evaluate(const State &state, const Grid &grid, const Settings &settin
         }
         if (settings.conduction && !pistonFace)
             flux[TotalEnergy] -= params::k * (decode(cells[3]).T - decode(cells[2]).T) / spacing;
-        const bool hasLeft = alongX ? i > 0 : j > 0, hasRight = alongX ? i < grid.nx : j < grid.ny;
-        const int l = grid.index(std::clamp(i - (alongX ? 1 : 0), 0, grid.nx - 1),
-                                 std::clamp(j - (alongX ? 0 : 1), 0, grid.ny - 1));
-        const int r = grid.index(std::clamp(i, 0, grid.nx - 1), std::clamp(j, 0, grid.ny - 1));
-        if (hasLeft)
-            result.rhs.col(l) -= flux / spacing;
-        else
-            result.boundary += flux.head<conservedFieldCount>() * (alongX ? grid.dy() : grid.dx());
-        if (hasRight)
-            result.rhs.col(r) += flux / spacing;
-        else
-            result.boundary -= flux.head<conservedFieldCount>() * (alongX ? grid.dy() : grid.dx());
+        result.flux = flux;
         // D alpha_k / Dt = 0. Partial masses remain strictly conservative.
-        const double velocity = pistonFace ? 0 : .5 * (uL + uR) - meshVelocity;
-        for (int phase = 0; phase < 3; ++phase)
+        result.velocity = pistonFace ? 0 : .5 * (uL + uR) - meshVelocity;
+        return result;
+    };
+    // x-face (i, j) sits between cells (i-1, j) and (i, j), for i = 0..nx;
+    // y-face (i, j) sits between cells (i, j-1) and (i, j), for j = 0..ny.
+    const int xFacesPerRow = grid.nx + 1;
+    const int xFaceCount = xFacesPerRow * grid.ny, yFaceCount = grid.nx * (grid.ny + 1);
+    const std::unique_ptr<FaceFlux[]> xFaces(new FaceFlux[xFaceCount]),
+        yFaces(new FaceFlux[yFaceCount]);
+    parallelFor(xFaceCount, [&](int f)
+                { xFaces[f] = face(f % xFacesPerRow, f / xFacesPerRow, true); });
+    parallelFor(yFaceCount, [&](int f)
+                { yFaces[f] = face(f % grid.nx, f / grid.nx, false); });
+    // Gather: each cell adds its own four faces, in the order the original
+    // face-by-face scatter visited them (x faces i, i+1, then y faces j, j+1).
+    parallelFor(grid.size(), [&](int cell)
+    {
+        const int i = cell % grid.nx, j = cell / grid.nx;
+        auto rhs = result.rhs.col(cell);
+        rhs.setZero();
+        auto inflow = [&](const FaceFlux &f, double spacing) // cell is right of the face
         {
-            const int k = AlphaRDX + phase;
-            if (hasLeft)
-                result.rhs(k, l) += state(k, l) * velocity / spacing;
-            if (hasRight)
-                result.rhs(k, r) -= state(k, r) * velocity / spacing;
-        }
+            rhs += f.flux / spacing;
+            for (int k = AlphaRDX; k <= AlphaPore; ++k)
+                rhs[k] -= state(k, cell) * f.velocity / spacing;
+        };
+        auto outflow = [&](const FaceFlux &f, double spacing) // cell is left of the face
+        {
+            rhs -= f.flux / spacing;
+            for (int k = AlphaRDX; k <= AlphaPore; ++k)
+                rhs[k] += state(k, cell) * f.velocity / spacing;
+        };
+        inflow(xFaces[j * xFacesPerRow + i], grid.dx());
+        outflow(xFaces[j * xFacesPerRow + i + 1], grid.dx());
+        inflow(yFaces[j * grid.nx + i], grid.dy());
+        outflow(yFaces[(j + 1) * grid.nx + i], grid.dy());
+    });
+    // Serial reductions over faces, in the original visiting order.
+    auto reduceFace = [&](const FaceFlux &f)
+    {
+        inverseDt = std::max(inverseDt, f.inverseDt);
+        result.faceFallbacks += f.fallback;
     };
     for (int j = 0; j < grid.ny; ++j)
+    {
         for (int i = 0; i <= grid.nx; ++i)
-            face(i, j, true);
-    for (int j = 0; j <= grid.ny; ++j)
-        for (int i = 0; i < grid.nx; ++i)
-            face(i, j, false);
+            reduceFace(xFaces[j * xFacesPerRow + i]);
+        result.boundary += xFaces[j * xFacesPerRow].flux.head<conservedFieldCount>() * grid.dy();
+        result.boundary -=
+            xFaces[j * xFacesPerRow + grid.nx].flux.head<conservedFieldCount>() * grid.dy();
+    }
+    for (int f = 0; f < yFaceCount; ++f)
+        reduceFace(yFaces[f]);
+    for (int i = 0; i < grid.nx; ++i)
+        result.boundary += yFaces[i].flux.head<conservedFieldCount>() * grid.dx();
+    for (int i = 0; i < grid.nx; ++i)
+        result.boundary -= yFaces[grid.ny * grid.nx + i].flux.head<conservedFieldCount>() * grid.dx();
     result.stepLimit = .08 / std::max(inverseDt, 1e-30);
     if (settings.reactions)
+    {
+        // Chemistry is local to each cell; heat release and time-step limits are
+        // stored per cell and reduced afterwards in cell order.
+        std::vector<double> cellHeat(grid.size(), 0), cellLimit(grid.size(), 0);
+        parallelFor(grid.size(), [&](int cell)
+        {
+            if (!(state(AlphaRhoRDX, cell) > 0))
+                return;
+            const auto &q = primitive[cell];
+            const double r1 =
+                reactionRates::computeArrhenius(q.T, params::R, params::E1, params::Z1);
+            const double r2 =
+                reactionRates::computeArrhenius(q.T, params::R, params::E2, params::Z2);
+            const double rate1 = r1 * state(Species1Mass, cell),
+                         rate2 = r2 * state(Species2Mass, cell);
+            const double heat =
+                (params::rho_init / q.density[0]) *
+                (reactionRates::computeReactionHeat(params::a1, params::b1, q.T) * rate1 +
+                 reactionRates::computeReactionHeat(params::a2, params::b2, q.T) * rate2);
+            result.rhs(Species1Mass, cell) -= rate1;
+            result.rhs(Species2Mass, cell) += rate1 - rate2;
+            result.rhs(Species3Mass, cell) += rate2;
+            result.rhs(TotalEnergy, cell) += heat;
+            cellHeat[cell] = heat;
+            const double referenceChange =
+                rate1 * std::abs(multimaterialEOS::rdxReferenceEnergy(q.density[0], false) -
+                                 multimaterialEOS::rdxReferenceEnergy(q.density[0], true));
+            cellLimit[cell] = std::min(.08 / std::max({r1, r2, 1e-30}),
+                                       .05 * q.heatCapacityVolume * q.T /
+                                           std::max(std::abs(heat) + referenceChange, 1e-30));
+        });
         for (int cell = 0; cell < grid.size(); ++cell)
             if (state(AlphaRhoRDX, cell) > 0)
             {
-                const auto &q = primitive[cell];
-                const double r1 =
-                    reactionRates::computeArrhenius(q.T, params::R, params::E1, params::Z1);
-                const double r2 =
-                    reactionRates::computeArrhenius(q.T, params::R, params::E2, params::Z2);
-                const double rate1 = r1 * state(Species1Mass, cell),
-                             rate2 = r2 * state(Species2Mass, cell);
-                const double heat =
-                    (params::rho_init / q.density[0]) *
-                    (reactionRates::computeReactionHeat(params::a1, params::b1, q.T) * rate1 +
-                     reactionRates::computeReactionHeat(params::a2, params::b2, q.T) * rate2);
-                result.rhs(Species1Mass, cell) -= rate1;
-                result.rhs(Species2Mass, cell) += rate1 - rate2;
-                result.rhs(Species3Mass, cell) += rate2;
-                result.rhs(TotalEnergy, cell) += heat;
-                result.reactionHeat += heat * grid.dx() * grid.dy();
-                result.stepLimit = std::min(result.stepLimit, .08 / std::max({r1, r2, 1e-30}));
-                const double referenceChange =
-                    rate1 * std::abs(multimaterialEOS::rdxReferenceEnergy(q.density[0], false) -
-                                     multimaterialEOS::rdxReferenceEnergy(q.density[0], true));
-                result.stepLimit = std::min(result.stepLimit,
-                                            .05 * q.heatCapacityVolume * q.T /
-                                                std::max(std::abs(heat) + referenceChange, 1e-30));
+                result.reactionHeat += cellHeat[cell] * grid.dx() * grid.dy();
+                result.stepLimit = std::min(result.stepLimit, cellLimit[cell]);
             }
+    }
+    return result;
+}
+// Elementwise state arithmetic, one cell (column) per iteration across threads.
+template <class Combine>
+State combineStates(int cells, const Combine &combine)
+{
+    State result(stateFieldCount, cells);
+    parallelFor(cells, [&](int cell) { result.col(cell) = combine(cell); });
     return result;
 }
 struct Step
@@ -378,15 +498,49 @@ struct Step
     double reactionHeat;
     long faceFallbacks;
 };
-Step RK3Step(const State &initial, const Grid &grid, const Settings &settings, double dt,
-             bool highOrder, const Evaluation &r0)
+// Cells whose state cannot be decoded (instead of throwing at the first one).
+std::vector<int> invalidCells(const State &state, const Grid &grid)
 {
+    std::vector<char> bad(grid.size(), 0);
+    parallelFor(grid.size(), [&](int cell)
+    {
+        try
+        {
+            decode(state.col(cell));
+        }
+        catch (const std::runtime_error &)
+        {
+            bad[cell] = 1;
+        }
+    });
+    std::vector<int> cells;
+    for (int cell = 0; cell < grid.size(); ++cell)
+        if (bad[cell])
+            cells.push_back(cell);
+    return cells;
+}
+
+// lowOrderCells (optional, zeroed by the caller) enables a-posteriori local
+// limiting: when a stage leaves invalid cells, those cells are flagged, their
+// faces are recomputed with first-order Rusanov states, and the stage is redone.
+// A cell that fails again while flagged also flags its 3x3 neighbourhood. Fluxes
+// are still shared by both neighbours of a face, so the update stays conservative.
+// Without lowOrderCells, any invalid cell throws (the caller then cuts dt).
+Step RK3Step(const State &initial, const Grid &grid, const Settings &settings, double dt,
+             bool highOrder, const Evaluation &r0, std::vector<char> *lowOrderCells = nullptr)
+{
+    constexpr int maxLocalPasses = 4;
+    const bool local = highOrder && lowOrderCells;
     Conserved supportExchange = Conserved::Zero();
-    auto advance = [&](const State &state, const Evaluation &rate, double weight) -> State
+    // Forward-Euler stage; the support exchange is only kept once the stage is accepted.
+    auto euler = [&](const State &state, const Evaluation &rate, double weight,
+                     Conserved &exchange) -> State
     {
         if (dt > rate.stepLimit * (1 + 1e-12))
             throw std::runtime_error("Stage CFL/source limit exceeded");
-        State next = state + dt * rate.rhs;
+        State next = combineStates(grid.size(), [&](int cell) -> Cell
+                                   { return state.col(cell) + dt * rate.rhs.col(cell); });
+        exchange.setZero();
         // The stationary support removes mechanical work; it does not heat the film.
         for (int cell : settings.fixedCells)
         {
@@ -397,23 +551,75 @@ Step RK3Step(const State &initial, const Grid &grid, const Settings &settings, d
             next(MomentumX,cell) = next(MomentumY,cell) = 0;
             next(TotalEnergy,cell) -= kinetic;
             const double volumeWeight = weight*grid.dx()*grid.dy();
-            supportExchange[MomentumX] -= volumeWeight*mx;
-            supportExchange[MomentumY] -= volumeWeight*my;
-            supportExchange[TotalEnergy] -= volumeWeight*kinetic;
+            exchange[MomentumX] -= volumeWeight*mx;
+            exchange[MomentumY] -= volumeWeight*my;
+            exchange[TotalEnergy] -= volumeWeight*kinetic;
         }
-        validate(next, grid);
         return next;
     };
-    const State stage1 = advance(initial, r0, 1.0/6);
-    const auto r1 = evaluate(stage1, grid, settings, highOrder);
-    const State stage2 = .75 * initial + .25 * advance(stage1, r1, 1.0/6);
+    // rate may be redirected to `storage`, a locally first-order re-evaluation of `state`.
+    auto advance = [&](const State &state, const Evaluation *&rate, Evaluation &storage,
+                       double weight) -> State
+    {
+        for (int pass = 0;; ++pass)
+        {
+            Conserved exchange;
+            State next = euler(state, *rate, weight, exchange);
+            if (!local)
+                validate(next, grid);
+            else
+            {
+                const auto bad = invalidCells(next, grid);
+                if (!bad.empty())
+                {
+                    bool widened = false;
+                    for (int cell : bad)
+                    {
+                        if (!(*lowOrderCells)[cell])
+                        {
+                            (*lowOrderCells)[cell] = 1;
+                            widened = true;
+                            continue;
+                        }
+                        const int i = cell % grid.nx, j = cell / grid.nx;
+                        for (int dj = -1; dj <= 1; ++dj)
+                            for (int di = -1; di <= 1; ++di)
+                            {
+                                const int ni = i + di, nj = j + dj;
+                                if (ni < 0 || nj < 0 || ni >= grid.nx || nj >= grid.ny)
+                                    continue;
+                                char &flag = (*lowOrderCells)[grid.index(ni, nj)];
+                                widened |= !flag;
+                                flag = 1;
+                            }
+                    }
+                    if (!widened || pass == maxLocalPasses)
+                        validate(next, grid); // throws with the failing cell; caller cuts dt
+                    storage = evaluate(state, grid, settings, true, lowOrderCells);
+                    rate = &storage;
+                    continue;
+                }
+            }
+            supportExchange += exchange;
+            return next;
+        }
+    };
+    Evaluation e0Local, e1 = {}, e2 = {};
+    const Evaluation *e0 = &r0, *p1 = &e1, *p2 = &e2;
+    const State stage1 = advance(initial, e0, e0Local, 1.0/6);
+    e1 = evaluate(stage1, grid, settings, highOrder, lowOrderCells);
+    const State advanced1 = advance(stage1, p1, e1, 1.0/6);
+    const State stage2 = combineStates(grid.size(), [&](int cell) -> Cell
+                                       { return .75 * initial.col(cell) + .25 * advanced1.col(cell); });
     validate(stage2, grid);
-    const auto r2 = evaluate(stage2, grid, settings, highOrder);
-    State finalState = initial / 3 + (2.0 / 3) * advance(stage2, r2, 2.0/3);
+    e2 = evaluate(stage2, grid, settings, highOrder, lowOrderCells);
+    const State advanced2 = advance(stage2, p2, e2, 2.0/3);
+    State finalState = combineStates(grid.size(), [&](int cell) -> Cell
+                                     { return initial.col(cell) / 3 + (2.0 / 3) * advanced2.col(cell); });
     validate(finalState, grid);
-    return {std::move(finalState), dt * (r0.boundary / 6 + r1.boundary / 6 + 2 * r2.boundary / 3) + supportExchange,
-            dt * (r0.reactionHeat / 6 + r1.reactionHeat / 6 + 2 * r2.reactionHeat / 3),
-            r0.faceFallbacks + r1.faceFallbacks + r2.faceFallbacks};
+    return {std::move(finalState), dt * (e0->boundary / 6 + e1.boundary / 6 + 2 * e2.boundary / 3) + supportExchange,
+            dt * (e0->reactionHeat / 6 + e1.reactionHeat / 6 + 2 * e2.reactionHeat / 3),
+            e0->faceFallbacks + e1.faceFallbacks + e2.faceFallbacks};
 }
 
 #ifndef MECHANICS2DMULTIMATERIAL_NO_MAIN
@@ -423,7 +629,7 @@ int main(int argc, char **argv)
     {
         std::cerr << "Usage: " << argv[0]
                   << " Nx Ny Lx Ly dt output.e|csv steps stride piston_velocity radius [--density-map "
-                     "x_y_rho_phase.csv] [--thinc-beta value] [--no-chemistry] [--no-conduction] [--rdx-velocity vx vy] [--open-boundaries] [--fixed-ps-ends width]\n";
+                     "x_y_rho_phase.csv] [--thinc-beta value] [--no-chemistry] [--no-conduction] [--rdx-velocity vx vy] [--open-boundaries] [--fixed-ps-ends width] [--high-order-halvings n]\n";
         return 1;
     }
     try
@@ -451,6 +657,8 @@ int main(int argc, char **argv)
             }
             else if (option == "--fixed-ps-ends" && a + 1 < argc)
                 supportWidth = std::stod(argv[++a]);
+            else if (option == "--high-order-halvings" && a + 1 < argc)
+                settings.highOrderHalvings = std::stoi(argv[++a]);
             else if (option == "--open-boundaries")
                 settings.openBoundaries = true;
             else if (option == "--no-chemistry")
@@ -469,6 +677,8 @@ int main(int argc, char **argv)
             throw std::invalid_argument("Invalid grid/time/THINC parameters");
         if ((settings.openBoundaries || supportWidth > 0) && pistonVelocity != 0)
             throw std::invalid_argument("Open boundaries/supports require zero piston velocity");
+        if (settings.highOrderHalvings < 0 || settings.highOrderHalvings > 20)
+            throw std::invalid_argument("--high-order-halvings must be between 0 and 20");
         if (supportWidth < 0 || supportWidth >= grid.lx/2)
             throw std::invalid_argument("Invalid support width");
         if (mapPath.empty() && (rdxVx != 0 || rdxVy != 0 || supportWidth > 0))
@@ -514,6 +724,9 @@ int main(int argc, char **argv)
         if (supportWidth > 0 && settings.fixedCells.empty())
             throw std::invalid_argument("No PS cells found in end-support strips");
         validate(state, grid);
+#ifdef _OPENMP
+        std::cout << "OpenMP threads: " << omp_get_max_threads() << "\n";
+#endif
         settings.pistonVelocity = pistonVelocity;
         if (settings.openBoundaries) std::cout << "Stationary mesh, open boundaries; support cells " << settings.fixedCells.size() << "\n";
         else std::cout << "Piston velocity " << pistonVelocity << " nm/ns; translating mesh, impermeable left wall\n";
@@ -558,18 +771,21 @@ int main(int argc, char **argv)
             state.topRows<conservedFieldCount>().rowwise().sum() * volume;
         Conserved boundary = Conserved::Zero();
         double reactionHeat = 0;
-        long substeps = 0, retries = 0, fallbackSteps = 0;
+        long substeps = 0, retries = 0, fallbackSteps = 0, lowOrderCellUpdates = 0,
+             globalFallbackSteps = 0;
+        std::vector<char> lowOrderCells(grid.size(), 0);
         std::ofstream diagnostics(outputPath + ".diagnostics.csv");
         diagnostics.exceptions(std::ios::failbit | std::ios::badbit);
         diagnostics
             << std::setprecision(17)
             << "time_ns,rdx_mass_error,ps_mass_error,air_mass_error,mx_error,my_error,energy_error,"
-               "Tmin,Tmax,max_fraction_sum_error,internal_steps,retries,low_order_steps\n";
+               "Tmin,Tmax,max_fraction_sum_error,internal_steps,retries,low_order_steps,"
+               "low_order_cells,global_low_order_steps\n";
         auto save = [&](int step, double time)
         {
             std::vector<Eigen::VectorXd> fields(names.size(), Eigen::VectorXd(grid.size()));
             double minT = 1e300, maxT = 0, maxFractionError = 0;
-            for (int cell = 0; cell < grid.size(); ++cell)
+            parallelFor(grid.size(), [&](int cell)
             {
                 const auto q = decode(state.col(cell));
                 for (int k = 0; k < 3; ++k)
@@ -588,10 +804,14 @@ int main(int argc, char **argv)
                 }
                 fields[18][cell] = settings.pistonVelocity*time;
                 fields[19][cell] = 0;
-                minT = std::min(minT, q.T);
-                maxT = std::max(maxT, q.T);
-                maxFractionError =
-                    std::max(maxFractionError, std::abs(q.alpha[0] + q.alpha[1] + q.alpha[2] - 1));
+            });
+            for (int cell = 0; cell < grid.size(); ++cell)
+            {
+                minT = std::min(minT, fields[3][cell]);
+                maxT = std::max(maxT, fields[3][cell]);
+                maxFractionError = std::max(
+                    maxFractionError,
+                    std::abs(fields[9][cell] + fields[10][cell] + fields[11][cell] - 1));
             }
             if (exodus)
                 exodus->write(time, fields);
@@ -613,7 +833,8 @@ int main(int argc, char **argv)
             for (int k = AlphaRhoRDX; k <= TotalEnergy; ++k)
                 diagnostics << ',' << error[k];
             diagnostics << ',' << minT << ',' << maxT << ',' << maxFractionError << ',' << substeps
-                        << ',' << retries << ',' << fallbackSteps << '\n';
+                        << ',' << retries << ',' << fallbackSteps << ',' << lowOrderCellUpdates << ','
+                        << globalFallbackSteps << '\n';
             std::cout << "time " << time << " ns, T=[" << minT << ',' << maxT << "], energy error "
                       << error[TotalEnergy] << '\n';
         };
@@ -625,39 +846,58 @@ int main(int argc, char **argv)
             while (time < target)
             {
                 const auto rate = evaluate(state, grid, settings);
-                double dt = std::min(target - time, .9 * rate.stepLimit);
+                const double fullDt = std::min(target - time, .9 * rate.stepLimit);
                 bool accepted = false;
                 std::string lastError;
-                for (int attempt = 0; attempt < 24 && !accepted; ++attempt)
+                // mode 0: WENO/THINC everywhere; 1: local first order on flagged cells;
+                // 2: first order everywhere (last resort).
+                auto attempt = [&](double dt, int mode) -> bool
                 {
                     if (time + dt == time)
-                        break;
-                    for (bool highOrder : {true, false})
-                        try
-                        {
-                            auto next =
-                                RK3Step(state, grid, settings, dt, highOrder,
-                                        highOrder ? rate : evaluate(state, grid, settings, false));
-                            state = std::move(next.state);
-                            boundary += next.boundary;
-                            reactionHeat += next.reactionHeat;
-                            time += dt;
-                            ++substeps;
-                            if (!highOrder)
-                                ++fallbackSteps;
-                            accepted = true;
-                            break;
-                        }
-                        catch (const std::runtime_error &error)
-                        {
-                            lastError = error.what();
-                        }
-                    if (!accepted)
+                        return false;
+                    if (mode == 1)
+                        std::fill(lowOrderCells.begin(), lowOrderCells.end(), 0);
+                    try
                     {
-                        dt *= .5;
-                        ++retries;
+                        auto next = RK3Step(state, grid, settings, dt, mode != 2,
+                                            mode == 2 ? evaluate(state, grid, settings, false) : rate,
+                                            mode == 1 ? &lowOrderCells : nullptr);
+                        state = std::move(next.state);
+                        boundary += next.boundary;
+                        reactionHeat += next.reactionHeat;
+                        time += dt;
+                        ++substeps;
+                        if (mode == 1)
+                        {
+                            const long flagged =
+                                std::count(lowOrderCells.begin(), lowOrderCells.end(), 1);
+                            fallbackSteps += flagged > 0;
+                            lowOrderCellUpdates += flagged;
+                        }
+                        if (mode == 2)
+                            ++globalFallbackSteps;
+                        return true;
                     }
-                }
+                    catch (const std::runtime_error &error)
+                    {
+                        lastError = error.what();
+                        ++retries;
+                        return false;
+                    }
+                };
+                // 1) Keep high order everywhere and cut dt: fullDt, fullDt/2, ...
+                double dt = fullDt;
+                for (int cut = 0; cut <= settings.highOrderHalvings && !accepted; ++cut, dt *= .5)
+                    accepted = attempt(dt, 0);
+                // 2) Then local first-order Rusanov only around the failing cells,
+                //    again starting from the full step and cutting dt if needed.
+                dt = fullDt;
+                for (int cut = 0; cut < 24 && !accepted; ++cut, dt *= .5)
+                    accepted = attempt(dt, 1);
+                // 3) Last resort: the old global first-order step.
+                dt = fullDt;
+                for (int cut = 0; cut < 24 && !accepted; ++cut, dt *= .5)
+                    accepted = attempt(dt, 2);
                 if (!accepted)
                     throw std::runtime_error("Cannot advance at time " + std::to_string(time) +
                                              ": " + lastError);

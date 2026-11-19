@@ -1,6 +1,8 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include "modelParams.h"
+#include "pressureRDX.h"
 
 namespace plasticityRDX{
 
@@ -17,21 +19,21 @@ namespace plasticityRDX{
         //strain hardening
         const double strainHardening = A + B * std::pow(ep, n);
 
-        //strain rate hardening
-        const double strainRate = increment > 0.0 ? increment : params::ref_ep;
-        const double strainRateHardening = 1.0 + C * std::log(strainRate / 1.0);
+        //strain rate hardening, relative to the reference rate ref_ep (1/ns);
+        //rates below the reference do not soften the material
+        const double strainRate = std::max(increment, params::ref_ep);
+        const double strainRateHardening = 1.0 + C * std::log(strainRate / params::ref_ep);
 
-        //thermal softening
-        const double theta = (T - T0) / (Tm - T0);
+        //thermal softening; theta is clamped to [0, 1] (no yield above the melt temperature)
+        const double theta = std::min(std::max((T - T0) / (Tm - T0), 0.0), 1.0);
         const double thermalSoftening = 1.0 - std::pow(theta, m_rdx);
 
         return strainHardening * strainRateHardening * thermalSoftening;
     }
 
-    inline double dT(double rho, double T, bool reacted){
-        const double omega = reacted ? params::omega_reacted : params::omega_unreacted;
-        const double cv = params::cv;
-        return - omega * rho * cv;
+    inline double yieldFunction(double eff_sigma, double ep, double increment, double T){
+        //compute the J2 yield function
+        return eff_sigma - yield(ep, increment, T);
     }
 
     inline double drho(double rho, double T, bool reacted){
@@ -56,7 +58,7 @@ namespace plasticityRDX{
         const double J = params::rho_init / rho;
         
         const double &dpdrho = drho(rho, T, reacted);
-        const double &dpdT = dT(rho, T, reacted);
+        const double &dpdT = pressureRDX::dT(rho, T, reacted);
 
         //construct squared sound speed
         const double c2 = dpdrho + (T / std::pow(rho, 2) / params::cv) * std::pow(dpdT, 2);
