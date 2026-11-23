@@ -1,0 +1,3 @@
+name=$1
+ffmpeg -i ${name}.ogv -c:v libx264 -crf 5 -c:a aac -b:a 192k ${name}.mp4
+open ${name}.mp4

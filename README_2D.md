@@ -318,3 +318,20 @@ Diagnostics columns: `low_order_steps` counts steps that needed the local fallba
 `low_order_cells` is the cumulative number of flagged cell-steps, and
 `global_low_order_steps` counts the last-resort global first-order steps. `retries` now
 counts every failed attempt.
+
+### Trace-phase cleanup (multimaterial and Lipit solvers)
+
+WENO5 is used on a face only when all six stencil cells have identical volume fractions;
+elsewhere the face is first order (THINC fractions, donor-cell states). The Rusanov
+dissipation leaks a little of every phase into each neighbour at every stage, so without
+cleanup trace fractions (down to subnormal values) reach nearly every cell within a few
+steps and the whole domain runs first order. After every step, a phase with
+`0 < alpha < --trace-fraction` (default `1e-8`) is merged into the cell's dominant phase:
+its volume and partial mass move to that phase, the dominant phase's mass-weighted fields
+(RDX species, solid stress and plastic strain in the Lipit solver) are scaled to keep
+their specific values, and the dominant fraction is set to exactly 1 minus the others.
+Total mass, momentum and energy are unchanged. The same pass clips round-off negatives in
+the RDX species, which WENO5 transport can produce where a species is ~0. On a 20 nm
+pore test this keeps WENO5 on ~96% of faces (0% without it). The diagnostics column
+`trace_mass_moved` is the cumulative mass moved between phases; `--trace-fraction 0`
+turns off the phase merging.

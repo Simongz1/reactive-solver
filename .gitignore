@@ -11,3 +11,7 @@
 *.exodus
 *.exo
 *.e
+
+#ignore pytorch containers
+*.pt
+*.npz
