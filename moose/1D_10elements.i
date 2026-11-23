@@ -205,15 +205,10 @@
         solve_type = newton
         petsc_options_iname = '-pc_type -pc_factor_mat_solver_type'
         petsc_options_value = 'lu       mumps'
-
         nl_rel_tol = 1e-8
         nl_abs_tol = 1e-10
         nl_max_its = 15
-
-        [TimeIntegrator]
-                type = LStableDirk4
-        []
-
+        
         [TimeStepper]
                 type = FunctionDT
                 function = timestep
@@ -222,9 +217,9 @@
         
         l_tol = 1e-8
         automatic_scaling = true
-        end_time = 1000
+        end_time = 10000
         line_search = 'bt'
-
+        
         [Quadrature]
                 type = TRAP
                 order = FIRST
@@ -234,7 +229,7 @@
 [Functions]
         [./timestep]
                 type = ParsedFunction
-                expression = '1e-4'
+                expression = '1e-1'
         [../]
 []
 
@@ -251,6 +246,7 @@
                 variable = 'T Y1 Y2 Y3'
                 start_point = '0 0 0'
                 end_point = '10000 0 0'
+                # 250 elements have 251 nodes, including both endpoints.
                 num_points = 251
                 sort_by = x
                 execute_on = 'INITIAL TIMESTEP_END'

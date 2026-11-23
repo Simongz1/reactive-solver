@@ -30,6 +30,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -88,6 +89,9 @@ bool wallLeft = true, wallRight = true, wallBottom = true, wallTop = true;
 //disp_x are shifted back to the laboratory frame.
 double pistonVelocity = 0;
 int highOrderHalvings = 3;
+//phase fractions below this are Rusanov leakage, removed after every step
+//(see removeTracePhases); 0 disables the cleanup
+double traceFraction = 1e-8;
 std::vector<int> supportCells; //PS cells held fixed (end supports)
 
 //primitive variables of one cell
@@ -135,11 +139,17 @@ Vars getCell(const State &state, int cell)
     return U;
 }
 
-//conserved state -> primitive variables. Returns false if the state is not physical.
-bool computePrimitive(const Vars &U, Primitive &q)
+//conserved state -> primitive variables. Returns false if the state is not physical;
+//reason (optional) then says which check failed.
+bool computePrimitive(const Vars &U, Primitive &q, std::string *reason = nullptr)
 {
+    auto fail = [&](const char *message)
+    {
+        if (reason) *reason = message;
+        return false;
+    };
     q = Primitive();
-    if (!U.allFinite()) return false;
+    if (!U.allFinite()) return fail("non-finite value");
 
     //phase fractions and densities
     double fractionSum = 0;
@@ -149,7 +159,8 @@ bool computePrimitive(const Vars &U, Primitive &q)
         const double mass = U[MASS_RDX + phase];
         //a phase whose mass has underflowed to zero can leave a subnormal fraction behind
         if (mass == 0 && alpha >= 0 && alpha < std::numeric_limits<double>::min()) alpha = 0;
-        if (alpha < 0 || alpha > 1 + 1e-10 || mass < 0 || (alpha == 0) != (mass == 0)) return false;
+        if (alpha < 0 || alpha > 1 + 1e-10 || mass < 0 || (alpha == 0) != (mass == 0))
+            return fail("invalid volume fraction or partial density");
 
         q.alpha[phase] = alpha;
         q.density[phase] = alpha > 0 ? mass / alpha : 0;
@@ -157,18 +168,20 @@ bool computePrimitive(const Vars &U, Primitive &q)
         q.heatCapacity += mass * multimaterialEOS::heatCapacity(phase);
         fractionSum += alpha;
     }
-    if (std::abs(fractionSum - 1) > 1e-9 || !(q.rho > 0)) return false;
+    if (std::abs(fractionSum - 1) > 1e-9 || !(q.rho > 0)) return fail("volume fractions do not sum to one");
 
     //RDX species, as fractions of the RDX mass
     const double rdxMass = U[MASS_RDX];
     double speciesSum = 0;
     for (int k = 0; k < 3; ++k)
     {
-        if (U[RHOY1 + k] < 0 || U[RHOY1 + k] > rdxMass * (1 + 1e-10)) return false;
+        //high-order transport can leave round-off negatives in species that are ~0;
+        //removeTracePhases clips them after every step
+        if (U[RHOY1 + k] < -1e-10 * rdxMass || U[RHOY1 + k] > rdxMass * (1 + 1e-10)) return fail("invalid species mass");
         q.Y[k] = rdxMass > 0 ? U[RHOY1 + k] / rdxMass : 0;
         speciesSum += U[RHOY1 + k];
     }
-    if (std::abs(speciesSum - rdxMass) > 1e-10 * std::max(rdxMass, 1e-30)) return false;
+    if (std::abs(speciesSum - rdxMass) > 1e-10 * std::max(rdxMass, 1e-30)) return fail("species do not sum to the RDX mass");
 
     q.u = U[MOMX] / q.rho;
     q.v = U[MOMY] / q.rho;
@@ -201,7 +214,7 @@ bool computePrimitive(const Vars &U, Primitive &q)
             coldEnergy += U[MASS_RDX + phase] * multimaterialEOS::referenceEnergy(phase, q.density[phase], q.Y[0]);
     const double kinetic = 0.5 * q.rho * (q.u * q.u + q.v * q.v);
     q.T = (U[ENERGY] - kinetic - coldEnergy - elasticEnergy) / q.heatCapacity;
-    if (!std::isfinite(q.T) || q.T <= 0) return false;
+    if (!std::isfinite(q.T) || q.T <= 0) return fail("non-positive temperature");
 
     //volume-weighted pressure and frozen sound speed
     double dpdT = 0, dpdrho = 0;
@@ -214,7 +227,7 @@ bool computePrimitive(const Vars &U, Primitive &q)
         dpdrho += a * rho * multimaterialEOS::pressureDensityDerivative(phase, rho, q.T, q.Y[0]);
     }
     const double c2 = dpdrho / q.rho + q.T * dpdT * dpdT / (q.rho * q.heatCapacity);
-    if (!std::isfinite(q.p) || !std::isfinite(c2) || c2 <= 0) return false;
+    if (!std::isfinite(q.p) || !std::isfinite(c2) || c2 <= 0) return fail("invalid pressure or sound speed");
 
     //longitudinal wave speed: bulk + 4/3 shear stiffness
     q.c = std::sqrt(c2 + 4.0 / 3.0 * shearStiffness / q.rho);
@@ -569,44 +582,82 @@ std::vector<int> findInvalidCells(const State &state)
     return cells;
 }
 
+//one line describing why a cell is not physical, for error messages
+std::string describeCell(const State &state, int cell)
+{
+    Primitive q;
+    std::string reason = "valid";
+    computePrimitive(getCell(state, cell), q, &reason);
+    std::ostringstream text;
+    text << std::setprecision(6) << "cell (" << cell % nx << ", " << cell / nx << ") at x = " << (cell % nx + 0.5) * dx
+         << " nm, y = " << (cell / nx + 0.5) * dy << " nm: " << reason << "; alpha (rdx ps air) = "
+         << state[ALPHA_RDX][cell] << ' ' << state[ALPHA_PS][cell] << ' ' << state[ALPHA_AIR][cell]
+         << ", alpha*rho = " << state[MASS_RDX][cell] << ' ' << state[MASS_PS][cell] << ' ' << state[MASS_AIR][cell];
+    return text.str();
+}
+
 //SSP-RK3 step. On failure the state is left unchanged and the function returns false;
 //badCells then lists the cells that became unphysical (empty if dt was too large).
 bool RK3Step(State &state, double dt, const std::vector<char> &firstOrder, std::vector<int> &badCells,
-             long &fallbackFaces)
+             long &fallbackFaces, std::string &failure)
 {
     const State state_n = state;
     State state1 = state_n, state2 = state_n;
 
     //first stage
     Residual R = assembleResidual(state_n, firstOrder);
-    if (dt > R.maxDt * (1 + 1e-12)) return false;
+    if (dt > R.maxDt * (1 + 1e-12))
+    {
+        failure = "time step above the stable limit of an RK stage";
+        return false;
+    }
     fallbackFaces += R.fallbackFaces;
     for (int k = 0; k < nFields; ++k)
         state1[k] = state_n[k] + dt * R.rate[k];
     applySupports(state1);
     badCells = findInvalidCells(state1);
-    if (!badCells.empty()) return false;
+    if (!badCells.empty())
+    {
+        failure = std::to_string(badCells.size()) + " invalid cell(s), first " + describeCell(state1, badCells[0]);
+        return false;
+    }
 
     //second stage
     R = assembleResidual(state1, firstOrder);
-    if (dt > R.maxDt * (1 + 1e-12)) return false;
+    if (dt > R.maxDt * (1 + 1e-12))
+    {
+        failure = "time step above the stable limit of an RK stage";
+        return false;
+    }
     fallbackFaces += R.fallbackFaces;
     for (int k = 0; k < nFields; ++k)
         state2[k] = 0.75 * state_n[k] + 0.25 * state1[k] + 0.25 * dt * R.rate[k];
     applySupports(state2);
     badCells = findInvalidCells(state2);
-    if (!badCells.empty()) return false;
+    if (!badCells.empty())
+    {
+        failure = std::to_string(badCells.size()) + " invalid cell(s), first " + describeCell(state2, badCells[0]);
+        return false;
+    }
 
     //final stage
     R = assembleResidual(state2, firstOrder);
-    if (dt > R.maxDt * (1 + 1e-12)) return false;
+    if (dt > R.maxDt * (1 + 1e-12))
+    {
+        failure = "time step above the stable limit of an RK stage";
+        return false;
+    }
     fallbackFaces += R.fallbackFaces;
     State next = state_n;
     for (int k = 0; k < nFields; ++k)
         next[k] = (1.0 / 3.0) * state_n[k] + (2.0 / 3.0) * state2[k] + (2.0 / 3.0) * dt * R.rate[k];
     applySupports(next);
     badCells = findInvalidCells(next);
-    if (!badCells.empty()) return false;
+    if (!badCells.empty())
+    {
+        failure = std::to_string(badCells.size()) + " invalid cell(s), first " + describeCell(next, badCells[0]);
+        return false;
+    }
 
     state = next;
     return true;
@@ -725,6 +776,85 @@ std::vector<Eigen::VectorXd> outputFields(const State &state, double time)
     return fields;
 }
 
+//The Rusanov dissipation leaks a little of every phase into each neighbour at every
+//stage, so traces (down to subnormal values) spread over the whole domain. The WENO5
+//switch in reconstruct() needs identical fractions across the stencil, so without this
+//cleanup nearly every face falls back to first order within a few steps.
+//In each cell, a phase with 0 < alpha < traceFraction is merged into the dominant phase:
+//its volume and partial mass move to that phase, whose mass-weighted fields (RDX
+//species, solid stress and plastic strain) are scaled so their specific values stay
+//the same; the trace phase's own stress and plastic strain are dropped. Momentum and
+//total energy are untouched and the dominant fraction is set to exactly
+//1 - (other fractions). Total mass, momentum and energy are conserved exactly; the
+//per-phase mass moved is returned (per volume). It also clips round-off negatives in
+//the RDX species (the difference goes to the largest species, so they still sum to
+//the RDX mass exactly); that part runs even with traceFraction = 0.
+std::array<double, 3> removeTracePhases(State &state)
+{
+    std::array<double, 3> moved{};
+    for (int cell = 0; cell < nx * ny; ++cell)
+    {
+        int dominant = 0;
+        for (int phase = 1; phase < 3; ++phase)
+            if (state[ALPHA_RDX + phase][cell] > state[ALPHA_RDX + dominant][cell]) dominant = phase;
+        bool changed = false;
+        for (int phase = 0; phase < 3; ++phase)
+        {
+            const double alpha = state[ALPHA_RDX + phase][cell];
+            if (phase == dominant || !(alpha > 0) || alpha >= traceFraction) continue;  //none if traceFraction = 0
+            const double mass = state[MASS_RDX + phase][cell];
+            const double dominantMass = state[MASS_RDX + dominant][cell];
+            if (dominantMass > 0)
+            {
+                const double scale = (dominantMass + mass) / dominantMass;
+                if (dominant == RDX)
+                    for (int k = 0; k < 3; ++k) state[RHOY1 + k][cell] *= scale;
+                if (dominant < nSolids)
+                {
+                    for (int c = 0; c < 3; ++c) state[S11_RDX + 3 * dominant + c][cell] *= scale;
+                    state[EP_RDX + dominant][cell] *= scale;
+                }
+            }
+            if (phase == RDX)
+                for (int k = 0; k < 3; ++k) state[RHOY1 + k][cell] = 0;
+            if (phase < nSolids)
+            {
+                for (int c = 0; c < 3; ++c) state[S11_RDX + 3 * phase + c][cell] = 0;
+                state[EP_RDX + phase][cell] = 0;
+            }
+            state[MASS_RDX + dominant][cell] += mass;
+            state[MASS_RDX + phase][cell] = 0;
+            state[ALPHA_RDX + phase][cell] = 0;
+            moved[phase] -= mass;
+            moved[dominant] += mass;
+            changed = true;
+        }
+        //exact closure of the fractions (also removes round-off drift in pure cells)
+        double others = 0;
+        for (int phase = 0; phase < 3; ++phase)
+            if (phase != dominant) others += state[ALPHA_RDX + phase][cell];
+        if (changed || std::abs(state[ALPHA_RDX + dominant][cell] + others - 1) <= 1e-12)
+            state[ALPHA_RDX + dominant][cell] = 1 - others;
+
+        //species: clip round-off negatives, close the sum on the largest species
+        const double rdxMass = state[MASS_RDX][cell];
+        if (rdxMass > 0)
+        {
+            int largest = 0;
+            double sum = 0;
+            for (int k = 0; k < 3; ++k)
+            {
+                double &Yk = state[RHOY1 + k][cell];
+                if (Yk < 0) Yk = 0;
+                if (Yk > state[RHOY1 + largest][cell]) largest = k;
+                sum += Yk;
+            }
+            state[RHOY1 + largest][cell] += rdxMass - sum;
+        }
+    }
+    return moved;
+}
+
 int main(int argc, char *argv[])
 {
     if (argc < 9)
@@ -737,7 +867,7 @@ int main(int argc, char *argv[])
                      "  [--boundaries LRBT]        w = slip wall, o = open, for left right bottom top (default wwww)\n"
                      "  [--open-boundaries]        same as --boundaries oooo\n"
                      "  [--fixed-ps-ends width] [--thinc-beta value] [--cfl value]\n"
-                     "  [--high-order-halvings n] [--no-chemistry] [--no-conduction]\n";
+                     "  [--high-order-halvings n] [--trace-fraction value] [--no-chemistry] [--no-conduction]\n";
         return 1;
     }
 
@@ -781,6 +911,7 @@ int main(int argc, char *argv[])
             else if (option == "--thinc-beta" && a + 1 < argc) thincBeta = std::stod(argv[++a]);
             else if (option == "--cfl" && a + 1 < argc) cfl = std::stod(argv[++a]);
             else if (option == "--high-order-halvings" && a + 1 < argc) highOrderHalvings = std::stoi(argv[++a]);
+            else if (option == "--trace-fraction" && a + 1 < argc) traceFraction = std::stod(argv[++a]);
             else if (option == "--no-chemistry") reactions = false;
             else if (option == "--no-conduction") conduction = false;
             else throw std::invalid_argument("Unknown or incomplete option: " + option);
@@ -790,6 +921,8 @@ int main(int argc, char *argv[])
             throw std::invalid_argument("Invalid grid or time parameters");
         if (!(thincBeta > 0) || thincBeta > 10 || !(cfl > 0) || cfl > 1 || highOrderHalvings < 0)
             throw std::invalid_argument("Invalid --thinc-beta, --cfl or --high-order-halvings");
+        if (!(traceFraction >= 0) || traceFraction > 1e-3)
+            throw std::invalid_argument("--trace-fraction must be between 0 and 1e-3");
         if (mapPath.empty())
             throw std::invalid_argument("--density-map is required");
         if (supportWidth < 0 || supportWidth >= Lx / 2)
@@ -849,9 +982,10 @@ int main(int argc, char *argv[])
         std::ofstream diagnostics(outputPath + ".diagnostics.csv");
         diagnostics << std::setprecision(17)
                     << "time_ns,rdx_mass,ps_mass,air_mass,total_energy,Tmin,Tmax,max_sigma_eq,"
-                       "internal_steps,retries,first_order_steps,fallback_faces,yielded\n";
+                       "internal_steps,retries,first_order_steps,fallback_faces,yielded,trace_mass_moved\n";
 
         long internalSteps = 0, retries = 0, firstOrderSteps = 0, fallbackFaces = 0, yielded = 0;
+        double traceMoved = 0; //total phase mass moved by removeTracePhases
         auto save = [&](double time)
         {
             const auto fields = outputFields(state, time);
@@ -862,7 +996,7 @@ int main(int argc, char *argv[])
                         << ',' << state[MASS_AIR].sum() * volume << ',' << state[ENERGY].sum() * volume << ','
                         << fields[3].minCoeff() << ',' << fields[3].maxCoeff() << ',' << fields[21].maxCoeff()
                         << ',' << internalSteps << ',' << retries << ',' << firstOrderSteps << ',' << fallbackFaces
-                        << ',' << yielded << std::endl;
+                        << ',' << yielded << ',' << traceMoved << std::endl;
             std::cout << "time " << time << " ns, T=[" << fields[3].minCoeff() << ',' << fields[3].maxCoeff()
                       << "], max sigma_eq " << fields[21].maxCoeff() << " GPa\n";
         };
@@ -878,13 +1012,14 @@ int main(int argc, char *argv[])
                 double dt = std::min(target - time, 0.9 * stableTimeStep(state));
                 std::fill(firstOrder.begin(), firstOrder.end(), 0);
                 bool accepted = false;
+                std::string failure;
 
                 //1) retry the high-order step with dt/2, dt/4, ...
                 //2) then use first-order fluxes around the cells that failed (widening if needed)
                 for (int attempt = 0; attempt < 40 && time + dt > time; ++attempt)
                 {
                     std::vector<int> badCells;
-                    if (RK3Step(state, dt, firstOrder, badCells, fallbackFaces))
+                    if (RK3Step(state, dt, firstOrder, badCells, fallbackFaces, failure))
                     {
                         accepted = true;
                         break;
@@ -895,9 +1030,16 @@ int main(int argc, char *argv[])
                     if (halve) dt *= 0.5;
                 }
                 if (!accepted)
-                    throw std::runtime_error("Cannot advance at time " + std::to_string(time));
+                {
+                    std::ostringstream message;
+                    message << std::setprecision(6) << "Cannot advance at time " << time << " ns (last dt " << dt
+                            << " ns, " << std::count(firstOrder.begin(), firstOrder.end(), 1)
+                            << " cells first order): " << failure;
+                    throw std::runtime_error(message.str());
+                }
 
                 yielded += applyPlasticity(state, dt);
+                for (double m : removeTracePhases(state)) traceMoved += std::max(m, 0.0) * dx * dy;
                 time += dt;
                 ++internalSteps;
                 if (std::find(firstOrder.begin(), firstOrder.end(), 1) != firstOrder.end()) ++firstOrderSteps;

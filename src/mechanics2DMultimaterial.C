@@ -96,6 +96,9 @@ struct Settings
     // A failed high-order step is retried at dt/2, ..., dt/2^N before falling
     // back to local first-order fluxes around the cells that failed.
     int highOrderHalvings = 3;
+    // Phase fractions below this are Rusanov leakage, removed after every step
+    // (see removeTracePhases); 0 disables the cleanup.
+    double traceFraction = 1e-8;
 };
 
 // Decode phase densities from PARTIAL masses and volume fractions. Species are
@@ -134,7 +137,9 @@ Primitive decode(const Cell &U)
     double speciesSum = 0;
     for (int k = 0; k < 3; ++k)
     {
-        if (U[k] < 0 || U[k] > rdxMass * (1 + 1e-10))
+        // high-order transport can leave round-off negatives in species that are ~0;
+        // removeTracePhases clips them after every step
+        if (U[k] < -1e-10 * rdxMass || U[k] > rdxMass * (1 + 1e-10))
             throw std::runtime_error("Invalid RDX species mass");
         q.species[k] = rdxMass > 0 ? U[k] / rdxMass : 0;
         speciesSum += U[k];
@@ -198,6 +203,75 @@ Cell makeState(const std::array<double, 3> &alpha, const std::array<double, 3> &
     decode(U);
     return U;
 }
+
+// The Rusanov dissipation leaks a little of every phase into each neighbour at every
+// stage, so traces (down to subnormal values) spread over the whole domain. The WENO5
+// switch in reconstruct() needs identical fractions across the stencil, so without
+// this cleanup nearly every face falls back to first order within a few steps.
+// In each cell, a phase with 0 < alpha < threshold is merged into the dominant phase:
+// its volume and partial mass move to that phase (whose RDX species, if any, are
+// scaled to keep their fractions), momentum and total energy are untouched, and the
+// dominant fraction is set to exactly 1 - (other fractions). Total mass, momentum and
+// energy are conserved exactly; the per-phase mass moved is returned (per volume).
+// It also clips round-off negatives in the RDX species (the difference goes to the
+// largest species, so they still sum to the RDX mass exactly), even with threshold 0.
+std::array<double, 3> removeTracePhases(State &state, double threshold)
+{
+    std::array<double, 3> moved{};
+    for (Eigen::Index cell = 0; cell < state.cols(); ++cell)
+    {
+        auto U = state.col(cell);
+        int dominant = 0;
+        for (int phase = 1; phase < 3; ++phase)
+            if (U[AlphaRDX + phase] > U[AlphaRDX + dominant])
+                dominant = phase;
+        bool changed = false;
+        for (int phase = 0; phase < 3; ++phase)
+        {
+            const double alpha = U[AlphaRDX + phase];
+            if (phase == dominant || !(alpha > 0) || alpha >= threshold) // none if threshold = 0
+                continue;
+            const double mass = U[AlphaRhoRDX + phase];
+            if (dominant == 0 && U[AlphaRhoRDX] > 0)
+                for (int k = 0; k < 3; ++k)
+                    U[k] *= (U[AlphaRhoRDX] + mass) / U[AlphaRhoRDX];
+            if (phase == 0)
+                for (int k = 0; k < 3; ++k)
+                    U[k] = 0;
+            U[AlphaRhoRDX + dominant] += mass;
+            U[AlphaRhoRDX + phase] = 0;
+            U[AlphaRDX + phase] = 0;
+            moved[phase] -= mass;
+            moved[dominant] += mass;
+            changed = true;
+        }
+        // exact closure of the fractions (also removes round-off drift in pure cells)
+        double others = 0;
+        for (int phase = 0; phase < 3; ++phase)
+            if (phase != dominant)
+                others += U[AlphaRDX + phase];
+        if (changed || std::abs(U[AlphaRDX + dominant] + others - 1) <= 1e-12)
+            U[AlphaRDX + dominant] = 1 - others;
+
+        // species: clip round-off negatives, close the sum on the largest species
+        if (U[AlphaRhoRDX] > 0)
+        {
+            int largest = 0;
+            double sum = 0;
+            for (int k = 0; k < 3; ++k)
+            {
+                if (U[k] < 0)
+                    U[k] = 0;
+                if (U[k] > U[largest])
+                    largest = k;
+                sum += U[k];
+            }
+            U[largest] += U[AlphaRhoRDX] - sum;
+        }
+    }
+    return moved;
+}
+
 Cell pureState(int phase, double rho, double T = 300, double u = 0, double v = 0)
 {
     std::array<double, 3> alpha{}, density{};
@@ -629,7 +703,7 @@ int main(int argc, char **argv)
     {
         std::cerr << "Usage: " << argv[0]
                   << " Nx Ny Lx Ly dt output.e|csv steps stride piston_velocity radius [--density-map "
-                     "x_y_rho_phase.csv] [--thinc-beta value] [--no-chemistry] [--no-conduction] [--rdx-velocity vx vy] [--open-boundaries] [--fixed-ps-ends width] [--high-order-halvings n]\n";
+                     "x_y_rho_phase.csv] [--thinc-beta value] [--no-chemistry] [--no-conduction] [--rdx-velocity vx vy] [--open-boundaries] [--fixed-ps-ends width] [--high-order-halvings n] [--trace-fraction value]\n";
         return 1;
     }
     try
@@ -659,6 +733,8 @@ int main(int argc, char **argv)
                 supportWidth = std::stod(argv[++a]);
             else if (option == "--high-order-halvings" && a + 1 < argc)
                 settings.highOrderHalvings = std::stoi(argv[++a]);
+            else if (option == "--trace-fraction" && a + 1 < argc)
+                settings.traceFraction = std::stod(argv[++a]);
             else if (option == "--open-boundaries")
                 settings.openBoundaries = true;
             else if (option == "--no-chemistry")
@@ -677,6 +753,8 @@ int main(int argc, char **argv)
             throw std::invalid_argument("Invalid grid/time/THINC parameters");
         if ((settings.openBoundaries || supportWidth > 0) && pistonVelocity != 0)
             throw std::invalid_argument("Open boundaries/supports require zero piston velocity");
+        if (!(settings.traceFraction >= 0) || settings.traceFraction > 1e-3)
+            throw std::invalid_argument("--trace-fraction must be between 0 and 1e-3");
         if (settings.highOrderHalvings < 0 || settings.highOrderHalvings > 20)
             throw std::invalid_argument("--high-order-halvings must be between 0 and 20");
         if (supportWidth < 0 || supportWidth >= grid.lx/2)
@@ -771,6 +849,8 @@ int main(int argc, char **argv)
             state.topRows<conservedFieldCount>().rowwise().sum() * volume;
         Conserved boundary = Conserved::Zero();
         double reactionHeat = 0;
+        Conserved traceMoved = Conserved::Zero(); // per-phase mass moved by removeTracePhases
+        double traceMovedTotal = 0;
         long substeps = 0, retries = 0, fallbackSteps = 0, lowOrderCellUpdates = 0,
              globalFallbackSteps = 0;
         std::vector<char> lowOrderCells(grid.size(), 0);
@@ -780,7 +860,7 @@ int main(int argc, char **argv)
             << std::setprecision(17)
             << "time_ns,rdx_mass_error,ps_mass_error,air_mass_error,mx_error,my_error,energy_error,"
                "Tmin,Tmax,max_fraction_sum_error,internal_steps,retries,low_order_steps,"
-               "low_order_cells,global_low_order_steps\n";
+               "low_order_cells,global_low_order_steps,trace_mass_moved\n";
         auto save = [&](int step, double time)
         {
             std::vector<Eigen::VectorXd> fields(names.size(), Eigen::VectorXd(grid.size()));
@@ -829,12 +909,13 @@ int main(int argc, char **argv)
             Conserved error = state.topRows<conservedFieldCount>().rowwise().sum() * volume -
                               initialTotals - boundary;
             error[TotalEnergy] -= reactionHeat;
+            error -= traceMoved; // phase masses exchanged by the trace cleanup (total unchanged)
             diagnostics << time;
             for (int k = AlphaRhoRDX; k <= TotalEnergy; ++k)
                 diagnostics << ',' << error[k];
             diagnostics << ',' << minT << ',' << maxT << ',' << maxFractionError << ',' << substeps
                         << ',' << retries << ',' << fallbackSteps << ',' << lowOrderCellUpdates << ','
-                        << globalFallbackSteps << '\n';
+                        << globalFallbackSteps << ',' << traceMovedTotal << '\n';
             std::cout << "time " << time << " ns, T=[" << minT << ',' << maxT << "], energy error "
                       << error[TotalEnergy] << '\n';
         };
@@ -863,6 +944,12 @@ int main(int argc, char **argv)
                                             mode == 2 ? evaluate(state, grid, settings, false) : rate,
                                             mode == 1 ? &lowOrderCells : nullptr);
                         state = std::move(next.state);
+                        const auto moved = removeTracePhases(state, settings.traceFraction);
+                        for (int phase = 0; phase < 3; ++phase)
+                        {
+                            traceMoved[AlphaRhoRDX + phase] += moved[phase] * volume;
+                            traceMovedTotal += std::max(moved[phase], 0.0) * volume;
+                        }
                         boundary += next.boundary;
                         reactionHeat += next.reactionHeat;
                         time += dt;
