@@ -133,3 +133,83 @@ def predict(T, Y, dt, h=None, extent=None, model="increment_surrogate.pt", devic
     if key not in _models:
         _models[key] = KineticsSurrogate(model, device)
     return _models[key].predict(T, Y, dt, h=h, extent=extent)
+
+
+def main():
+    """Command line demo: march one hotspot and save figures.
+
+    python ml/surrogate.py --model increment_surrogate.pt --nx 64 --ny 64 --h 16 --dt 0.1 --steps 50
+    """
+    import argparse
+
+    p = argparse.ArgumentParser(description=main.__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", default="increment_surrogate.pt")
+    p.add_argument("--device", default="cpu")
+    p.add_argument("--nx", type=int, default=64)
+    p.add_argument("--ny", type=int, default=64)
+    p.add_argument("--h", type=float, nargs="+", default=[16.0], help="cell size, nm (one value, or hx hy)")
+    p.add_argument("--dt", type=float, default=0.1, help="step, ns")
+    p.add_argument("--steps", type=int, default=50)
+    p.add_argument("--radius", type=float, default=40.0, help="hotspot radius, nm")
+    p.add_argument("--t-hot", type=float, default=1800.0)
+    p.add_argument("--t-cold", type=float, default=300.0)
+    p.add_argument("--burnt", action="store_true", help="start the hotspot reacted (Y3 = 1)")
+    p.add_argument("--frames", type=int, default=4, help="snapshots in the figure")
+    p.add_argument("--output", default="surrogate_run")
+    args = p.parse_args()
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    model = KineticsSurrogate(args.model, args.device)
+    hx, hy = (args.h[0], args.h[0]) if len(args.h) == 1 else args.h[:2]
+    print(f"model {args.model}: trained h {model.h_range[0]:g}-{model.h_range[1]:g} nm, "
+          f"dt {model.dt_min:g}-{model.dt_max:g} ns; running {args.nx} x {args.ny} cells of {hx:g} x {hy:g} nm, "
+          f"dt {args.dt:g} ns ({model.substeps(args.dt, hx, hy, (args.nx, args.ny))} sub-steps each)")
+
+    x = (np.arange(args.nx) + 0.5 - args.nx / 2) * hx
+    y = (np.arange(args.ny) + 0.5 - args.ny / 2) * hy
+    hot = x[:, None] ** 2 + y[None, :] ** 2 <= args.radius ** 2
+    T = np.where(hot, args.t_hot, args.t_cold)
+    Y = np.zeros((3, args.nx, args.ny))
+    Y[0] = 1.0
+    if args.burnt:
+        Y[0][hot], Y[2][hot] = 0.0, 1.0
+
+    times, radius, snaps = [], [], []
+    keep = set(np.linspace(0, args.steps, args.frames).round().astype(int))
+    for s in range(args.steps + 1):
+        if s > 0:
+            T, Y = model.predict(T, Y, args.dt, h=(hx, hy))
+        times.append(s * args.dt)
+        radius.append(math.sqrt(Y[2].sum() * hx * hy / math.pi))
+        if s in keep:
+            snaps.append((s * args.dt, T.copy(), Y[2].copy()))
+            print(f"t = {s * args.dt:7.3f} ns: burnt radius {radius[-1]:6.1f} nm, T [{T.min():.0f}, {T.max():.0f}] K")
+
+    extent = [x[0] - hx / 2, x[-1] + hx / 2, y[0] - hy / 2, y[-1] + hy / 2]
+    fig, axes = plt.subplots(2, len(snaps), figsize=(3 * len(snaps), 6), squeeze=False, constrained_layout=True)
+    for k, (t, Tk, Y3k) in enumerate(snaps):
+        imT = axes[0, k].imshow(Tk.T, origin="lower", extent=extent, cmap="inferno",
+                                vmin=args.t_cold, vmax=max(s[1].max() for s in snaps))
+        imY = axes[1, k].imshow(Y3k.T, origin="lower", extent=extent, cmap="viridis", vmin=0, vmax=1)
+        axes[0, k].set_title(f"t = {t:.3g} ns")
+    axes[0, 0].set_ylabel("T (K)\ny (nm)")
+    axes[1, 0].set_ylabel("Y3\ny (nm)")
+    fig.colorbar(imT, ax=axes[0])
+    fig.colorbar(imY, ax=axes[1])
+    fig.savefig(f"{args.output}_maps.png", dpi=150)
+
+    fig, ax = plt.subplots(figsize=(5, 3.5), constrained_layout=True)
+    ax.plot(times, radius)
+    ax.set_xlabel("time (ns)")
+    ax.set_ylabel("burnt radius (nm)")
+    ax.grid(alpha=0.3)
+    fig.savefig(f"{args.output}_radius.png", dpi=150)
+    np.savez_compressed(f"{args.output}.npz", times=np.array(times), radius=np.array(radius), T=T, Y=Y)
+    print(f"saved {args.output}_maps.png, {args.output}_radius.png, {args.output}.npz")
+
+
+if __name__ == "__main__":
+    main()
