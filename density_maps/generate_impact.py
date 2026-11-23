@@ -18,7 +18,7 @@ parser.add_argument("--flyer", type=str, default="circle")
 args = parser.parse_args()
 
 width = args.width
-thickness, radius = 250, 3750
+thickness, radius = 250, 3000
 
 if args.spacing <= 0 or args.height <= 0 or args.gap < 0 or args.film_bottom < 0:
     parser.error("Invalid geometry or spacing")
