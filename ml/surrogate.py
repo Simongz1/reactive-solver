@@ -45,10 +45,13 @@ class KineticsSurrogate:
             raise ValueError(f"{path} is not an increment surrogate (train_increment.py)")
         self.cfg = cfg
         self.device = torch.device(device)
-        self.model = Stepper(cfg["width"], cfg["depth"], cfg["dt_ref"], cfg["h_ref"]).to(self.device)
+        self.version = cfg.get("model_version", 1)
+        self.model = Stepper(cfg["width"], cfg["depth"], cfg["dt_ref"], cfg["h_ref"],
+                             version=self.version).to(self.device)
         self.model.load_state_dict(checkpoint["model"])
         self.model.eval()
-        self.dt_min, self.dt_max = cfg["dt_range"]
+        self.dt_min = cfg["dt_range"][0]
+        self.dt_max = cfg.get("dt_max", cfg["dt_range"][1])  # v2: synthetic large-cell steps go further
         self.courant = cfg["courant"]
         self.h_range = cfg["h_range"]
         self._warned = set()
@@ -164,7 +167,7 @@ def main():
 
     model = KineticsSurrogate(args.model, args.device)
     hx, hy = (args.h[0], args.h[0]) if len(args.h) == 1 else args.h[:2]
-    print(f"model {args.model}: trained h {model.h_range[0]:g}-{model.h_range[1]:g} nm, "
+    print(f"model {args.model} (version {model.version}): trained h {model.h_range[0]:g}-{model.h_range[1]:g} nm, "
           f"dt {model.dt_min:g}-{model.dt_max:g} ns; running {args.nx} x {args.ny} cells of {hx:g} x {hy:g} nm, "
           f"dt {args.dt:g} ns ({model.substeps(args.dt, hx, hy, (args.nx, args.ny))} sub-steps each)")
 
